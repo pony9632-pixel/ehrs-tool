@@ -9,19 +9,163 @@
 """
 import calendar as _cal
 import datetime as dt
+import re
 import threading
 import tkinter as tk
+from itertools import groupby
 from tkinter import messagebox, ttk
 
 import customtkinter as ctk
 
+import tkinter.filedialog as filedialog
+
+import openpyxl
+from openpyxl.styles import Alignment, Font, PatternFill
+
 from config import load_config, save_config
 from ehrs_client import DEFAULT_BASE_URL, EhrsClient
+from shift_codes_ref import SHIFT_CODES_REF
 
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
 _WEEK = "一二三四五六日"
+_REST_CODES = {"991"}   # 排班為休假時不列入異常偵測
+
+
+def _shift_times(code: str) -> tuple[str, str]:
+    """從 SHIFT_CODES_REF 解析班別的表定上班/下班時間（HH:MM）。"""
+    name, _ = SHIFT_CODES_REF.get(code, ("", 3))
+    m = re.search(r"(\d{2}:\d{2})-(\d{2}:\d{2})", name)
+    return (m.group(1), m.group(2)) if m else ("", "")
+
+
+def _punch_mins(t: str) -> int:
+    h, m = t.split(":")
+    return int(h) * 60 + int(m)
+
+
+def _split_punches(punches: list[str], sched_in: str, sched_out: str) -> tuple[str, str]:
+    """多筆打卡依距表定時間分為上班群/下班群，取上班群最早、下班群最晚。
+    無排班資料時直接取第一筆和最後一筆。"""
+    if not sched_in or not sched_out:
+        return punches[0], punches[-1]
+    si = _punch_mins(sched_in)
+    so = _punch_mins(sched_out)
+    if so < si:
+        so += 1440
+    in_grp, out_grp = [], []
+    for p in punches:
+        pm = _punch_mins(p)
+        if pm < si - 120:
+            pm += 1440
+        (out_grp if abs(pm - so) <= abs(pm - si) else in_grp).append(p)
+    return (in_grp[0] if in_grp else ""), (out_grp[-1] if out_grp else "")
+
+
+def _punch_remark(clock_in: str, clock_out: str, sched_in: str, sched_out: str) -> str:
+    """產生備注文字：遲到、早退、上班忘打卡、下班忘打卡（可複合）。"""
+    remarks: list[str] = []
+    if not clock_in:
+        remarks.append("上班忘打卡")
+    elif sched_in and _punch_mins(clock_in) > _punch_mins(sched_in):
+        remarks.append("遲到")
+    if not clock_out:
+        remarks.append("下班忘打卡")
+    elif sched_out and sched_in:
+        si = _punch_mins(sched_in)
+        so = _punch_mins(sched_out)
+        co = _punch_mins(clock_out)
+        if so < si:
+            so += 1440
+        if co < si - 120:
+            co += 1440
+        if co < so:
+            remarks.append("早退")
+    return " ".join(remarks)
+
+
+def _assign_single_punch(punch: str, sched_in: str, sched_out: str) -> tuple[str, str]:
+    """只有一筆打卡時，依距表定上班/下班的近遠判斷是實際上班還是實際下班。
+    回傳 (實際上班, 實際下班)，其中一個為空字串。"""
+    if not sched_in and not sched_out:
+        return punch, ""
+    p = _punch_mins(punch)
+    if sched_in and sched_out:
+        si = _punch_mins(sched_in)
+        so = _punch_mins(sched_out)
+        if so < si:
+            so += 1440
+        if p < si - 120:
+            p += 1440
+        return ("", punch) if abs(p - so) <= abs(p - si) else (punch, "")
+    return ("", punch) if sched_out else (punch, "")
+
+
+class _PunchTable(tk.Frame):
+    """Canvas-based table 支援單格著色。"""
+
+    COLS = [
+        ("員工代號",  90), ("員工姓名",  90), ("出勤日期", 110),
+        ("排班代號",  70), ("表定上班",  80), ("表定下班",  80),
+        ("實際上班",  80), ("實際下班",  80), ("備注",     140),
+    ]
+    ROW_H  = 23
+    HDR_H  = 28
+    FONT   = ("TkDefaultFont", 11)
+    BFONT  = ("TkDefaultFont", 11, "bold")
+    HDR_BG = "#D9E1F2"
+    BG     = ("#FFFFFF", "#F5F5F5")
+    GRID   = "#DDDDDD"
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent, **kw)
+        self._data: list[tuple] = []
+        self._cv = tk.Canvas(self, bg="#FFFFFF", highlightthickness=0)
+        vsb = ttk.Scrollbar(self, orient="vertical",   command=self._cv.yview)
+        hsb = ttk.Scrollbar(self, orient="horizontal", command=self._cv.xview)
+        self._cv.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self._cv.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        self._cv.bind("<MouseWheel>",
+                      lambda e: self._cv.yview_scroll(int(-1 * e.delta / 60), "units"))
+        self._tw = sum(w for _, w in self.COLS)
+        self._draw_header()
+
+    def _draw_header(self):
+        x = 0
+        for name, w in self.COLS:
+            self._cv.create_rectangle(x, 0, x+w, self.HDR_H,
+                                      fill=self.HDR_BG, outline=self.GRID)
+            self._cv.create_text(x + w//2, self.HDR_H//2,
+                                 text=name, font=self.BFONT, anchor="center")
+            x += w
+
+    def populate(self, rows: list[tuple]) -> None:
+        """rows: list of (values_tuple, fgs_tuple) — fgs 為各格顏色，空字串=黑。"""
+        self._cv.delete("row")
+        self._data = list(rows)
+        y = self.HDR_H
+        for i, (vals, fgs) in enumerate(rows):
+            bg = self.BG[i % 2]
+            x = 0
+            for j, (val, (_, w)) in enumerate(zip(vals, self.COLS)):
+                fg = fgs[j] if j < len(fgs) and fgs[j] else "#000000"
+                self._cv.create_rectangle(x, y, x+w, y+self.ROW_H,
+                                          fill=bg, outline=self.GRID, tags="row")
+                self._cv.create_text(x+6, y+self.ROW_H//2,
+                                     text="" if val is None else str(val),
+                                     font=self.FONT, fill=fg,
+                                     anchor="w", width=w-10, tags="row")
+                x += w
+            y += self.ROW_H
+        self._cv.configure(scrollregion=(0, 0, self._tw, y))
+
+    def all_values(self) -> list[tuple]:
+        return [v for v, _ in self._data]
 
 
 class EhrsApp(ctk.CTk):
@@ -35,7 +179,8 @@ class EhrsApp(ctk.CTk):
         self.cfg = load_config()
         self.schedule: list = []
         self.row_emp: dict = {}
-        self.shift_codes: dict[str, tuple[str, int]] = {}
+        self.shift_codes: dict[str, tuple[str, int]] = dict(SHIFT_CODES_REF)
+        self._punch_cache: list[tuple] = []
 
         self._build_ui()
         if auto_login:
@@ -66,6 +211,12 @@ class EhrsApp(ctk.CTk):
             side="left", padx=12
         )
         ctk.CTkLabel(bar, text="提示:雙擊格子可改班/刪班").pack(side="left", padx=8)
+        ctk.CTkButton(
+            bar, text="匯出 Excel", width=100, command=self._export_schedule
+        ).pack(side="right", padx=4)
+        ctk.CTkButton(
+            bar, text="匯入 Excel", width=100, command=self._import_schedule
+        ).pack(side="right", padx=4)
 
         wrap = tk.Frame(tab)
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
@@ -85,11 +236,13 @@ class EhrsApp(ctk.CTk):
         bar.pack(fill="x", padx=6, pady=6)
         today = dt.date.today()
         self.p_start = ctk.CTkEntry(bar, width=110)
-        self.p_start.insert(0, (today - dt.timedelta(days=7)).isoformat())
+        self.p_start.insert(0, today.replace(day=1).isoformat())
         self.p_end = ctk.CTkEntry(bar, width=110)
         self.p_end.insert(0, today.isoformat())
         self.p_emp = ctk.CTkEntry(bar, width=90, placeholder_text="員工代號")
         self.p_all = ctk.CTkCheckBox(bar, text="全員")
+        self.p_all.select()
+        self.p_abnormal = ctk.CTkCheckBox(bar, text="只顯示異常", command=self._apply_punch_filter)
         ctk.CTkLabel(bar, text="起").pack(side="left", padx=(8, 2))
         self.p_start.pack(side="left")
         ctk.CTkLabel(bar, text="迄").pack(side="left", padx=(10, 2))
@@ -97,30 +250,18 @@ class EhrsApp(ctk.CTk):
         ctk.CTkLabel(bar, text="員工").pack(side="left", padx=(10, 2))
         self.p_emp.pack(side="left")
         self.p_all.pack(side="left", padx=10)
+        self.p_abnormal.pack(side="left", padx=10)
         ctk.CTkButton(bar, text="查詢打卡", command=self._query_punch).pack(
             side="left", padx=12
         )
+        ctk.CTkButton(
+            bar, text="匯出 Excel", width=100, command=self._export_punch
+        ).pack(side="right", padx=4)
 
         wrap = tk.Frame(tab)
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-        cols = [
-            ("emp", "員工代號", 90),
-            ("name", "姓名", 90),
-            ("date", "出勤日期", 110),
-            ("time", "刷卡時間", 90),
-            ("src", "來源", 80),
-            ("clock", "卡鐘", 70),
-        ]
-        self.punch_tv = ttk.Treeview(
-            wrap, show="headings", columns=[c[0] for c in cols], height=18
-        )
-        for key, title, width in cols:
-            self.punch_tv.heading(key, text=title)
-            self.punch_tv.column(key, width=width, anchor="center")
-        ysb = ttk.Scrollbar(wrap, orient="vertical", command=self.punch_tv.yview)
-        self.punch_tv.configure(yscrollcommand=ysb.set)
-        self.punch_tv.grid(row=0, column=0, sticky="nsew")
-        ysb.grid(row=0, column=1, sticky="ns")
+        self.punch_tbl = _PunchTable(wrap)
+        self.punch_tbl.grid(row=0, column=0, sticky="nsew")
         wrap.rowconfigure(0, weight=1)
         wrap.columnconfigure(0, weight=1)
 
@@ -230,12 +371,13 @@ class EhrsApp(ctk.CTk):
         self._run_async(work, done)
 
     def _build_code_map(self, sched) -> None:
-        codes: dict[str, tuple[str, int]] = {}
         for emp in sched:
             for s in emp.shifts:
                 if s.code:
-                    codes[s.code] = (s.name, s.kind if s.kind is not None else 3)
-        self.shift_codes = codes
+                    self.shift_codes[s.code] = (
+                        s.name or self.shift_codes.get(s.code, ("", 3))[0],
+                        s.kind if s.kind is not None else 3,
+                    )
 
     def _populate_grid(self, year: int, month: int, sched) -> None:
         ndays = _cal.monthrange(year, month)[1]
@@ -294,21 +436,19 @@ class EhrsApp(ctk.CTk):
         options = ["(空白/刪除)"] + [
             f"{c} {n}" for c, (n, _k) in sorted(self.shift_codes.items())
         ]
-        default = (
-            f"{cur.code} {self.shift_codes.get(cur.code, (cur.name, 3))[0]}"
-            if cur
-            else options[0]
-        )
-        var = ctk.StringVar(value=default if default in options else options[0])
-        ctk.CTkOptionMenu(top, values=options, variable=var, width=300).pack(pady=10)
+        combo = ctk.CTkComboBox(top, values=options, width=300)
+        combo.set(cur.code if cur else "")
+        combo.pack(pady=10)
+        combo.focus_set()
+        top.bind("<Return>", lambda e: save())
 
         def save():
-            choice = var.get()
+            raw = combo.get().strip()
             top.destroy()
-            if choice.startswith("(空白"):
+            if not raw or raw.startswith("(空白"):
                 self._apply_delete(emp, date_str, cur)
             else:
-                self._apply_set(emp, date_str, choice.split()[0])
+                self._apply_set(emp, date_str, raw.split()[0])
 
         ctk.CTkButton(top, text="儲存", command=save).pack(pady=(6, 4))
         ctk.CTkButton(top, text="取消", command=top.destroy, fg_color="gray").pack()
@@ -357,6 +497,165 @@ class EhrsApp(ctk.CTk):
 
         self._run_async(work, done)
 
+    # --------------------------------------------------------- export / import
+    def _export_schedule(self) -> None:
+        if not self.schedule:
+            messagebox.showwarning("尚未載入", "請先載入排班。")
+            return
+        year, month = int(self.year_var.get()), int(self.month_var.get())
+        ndays = _cal.monthrange(year, month)[1]
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel 活頁簿", "*.xlsx")],
+            initialfile=f"排班_{year}-{month:02d}.xlsx",
+        )
+        if not path:
+            return
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = f"{year}-{month:02d}"
+        dates = [f"{year}-{month:02d}-{d:02d}" for d in range(1, ndays + 1)]
+        ws.append(["員工代號", "員工姓名"] + dates)
+        hdr_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+        wkend_fill = PatternFill(start_color="FFE0E0", end_color="FFE0E0", fill_type="solid")
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center", wrap_text=True)
+            cell.fill = hdr_fill
+        ws.row_dimensions[1].height = 36
+        for d in range(1, ndays + 1):
+            if _cal.weekday(year, month, d) >= 5:
+                ws.cell(1, d + 2).fill = wkend_fill
+        ws.column_dimensions["A"].width = 10
+        ws.column_dimensions["B"].width = 10
+        for i in range(3, ndays + 3):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = 7
+        for emp in self.schedule:
+            by_day = {s.date: s.code for s in emp.shifts}
+            ws.append([emp.emp_id, emp.name] + [by_day.get(d, "") for d in dates])
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(horizontal="center")
+            row[0].alignment = Alignment(horizontal="left")
+            row[1].alignment = Alignment(horizontal="left")
+        wb.save(path)
+        self._set_status(f"已匯出排班 → {path}")
+
+    def _export_punch(self) -> None:
+        data = self.punch_tbl.all_values()
+        if not data:
+            messagebox.showwarning("無資料", "請先查詢打卡。")
+            return
+        start = self.p_start.get().strip()
+        end = self.p_end.get().strip()
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel 活頁簿", "*.xlsx")],
+            initialfile=f"打卡_{start}_{end}.xlsx",
+        )
+        if not path:
+            return
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "打卡明細"
+        headers = ["員工代號", "員工姓名", "出勤日期", "排班代號", "表定上班", "表定下班", "實際上班", "實際下班", "備注"]
+        ws.append(headers)
+        hdr_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center")
+            cell.fill = hdr_fill
+        for row in data:
+            ws.append(list(row))
+        for i, w in enumerate([10, 10, 14, 10, 10, 10, 10, 10, 18], start=1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+        wb.save(path)
+        self._set_status(f"已匯出 {len(data)} 筆打卡 → {path}")
+
+    def _import_schedule(self) -> None:
+        if not self._need_client():
+            return
+        path = filedialog.askopenfilename(
+            filetypes=[("Excel 活頁簿", "*.xlsx *.xls")],
+            title="選擇排班 Excel",
+        )
+        if not path:
+            return
+        try:
+            wb = openpyxl.load_workbook(path, data_only=True)
+            ws = wb.active
+            rows = list(ws.iter_rows(values_only=True))
+        except Exception as exc:
+            messagebox.showerror("讀取失敗", str(exc))
+            return
+        if len(rows) < 2:
+            messagebox.showwarning("空檔", "Excel 沒有資料列。")
+            return
+        # 第一列找日期欄（YYYY-MM-DD 格式）
+        header = rows[0]
+        date_cols: dict[int, str] = {}
+        for i, h in enumerate(header):
+            h_str = str(h).strip() if h is not None else ""
+            if len(h_str) == 10 and h_str[4] == "-" and h_str[7] == "-":
+                try:
+                    dt.date.fromisoformat(h_str)
+                    date_cols[i] = h_str
+                except ValueError:
+                    pass
+        if not date_cols:
+            messagebox.showerror(
+                "格式錯誤",
+                "找不到日期欄（YYYY-MM-DD）。\n請使用本工具匯出的 Excel 再匯入。",
+            )
+            return
+        first_date = next(iter(date_cols.values()))
+        year, month = int(first_date[:4]), int(first_date[5:7])
+        # 收集有班別的格子，同一 emp+date 取最後一筆
+        seen: dict[tuple, dict] = {}
+        for row in rows[1:]:
+            if not row or not row[0]:
+                continue
+            emp_id = str(row[0]).strip()
+            for col_idx, date_str in date_cols.items():
+                raw = row[col_idx] if col_idx < len(row) else None
+                code = str(raw).strip() if raw is not None else ""
+                if code:
+                    seen[(emp_id, date_str)] = {
+                        "emp_id": emp_id, "date": date_str, "shift_code": code
+                    }
+        changes = list(seen.values())
+        if not changes:
+            messagebox.showinfo("無班別", "沒有找到任何班別資料。")
+            return
+        if not messagebox.askyesno(
+            "確認匯入",
+            f"將匯入 {year}-{month:02d} 排班，共 {len(changes)} 筆。\n\n"
+            "這會寫入正式班表，確定？",
+        ):
+            return
+        self._set_status(f"匯入中（{len(changes)} 筆）…")
+
+        def work():
+            return self.client.set_shifts_bulk(year, month, changes, dry_run=False)
+
+        def done(results):
+            ok_n = sum(1 for r in results if r.get("ok"))
+            fail_n = len(results) - ok_n
+            self._set_status(f"匯入完成：{ok_n} 筆成功，{fail_n} 筆失敗")
+            if fail_n:
+                errs = [
+                    f"{r['emp_id']} {r['date']}：{r.get('error', '未知')}"
+                    for r in results if not r.get("ok")
+                ]
+                messagebox.showwarning(
+                    "部分失敗",
+                    f"{fail_n} 筆寫入失敗：\n" + "\n".join(errs[:10])
+                    + ("\n…" if fail_n > 10 else ""),
+                )
+            self._load_schedule()
+
+        self._run_async(work, done)
+
     # ---------------------------------------------------------------- punch
     def _query_punch(self) -> None:
         if not self._need_client():
@@ -367,33 +666,99 @@ class EhrsApp(ctk.CTk):
         self._set_status("查詢打卡中…")
 
         def work():
-            return self.client.get_punch_records(
+            punch_rows = self.client.get_punch_records(
                 start, end, emp_start=emp, emp_end=emp, readable=True
             )
+            sched_map: dict[tuple, tuple] = {}
+            emp_names: dict[str, str] = {}
+            start_d = dt.date.fromisoformat(start)
+            end_d   = dt.date.fromisoformat(end)
+            cur = start_d.replace(day=1)
+            while cur <= end_d:
+                try:
+                    for es in self.client.get_schedule(cur.year, cur.month):
+                        emp_names[es.emp_id] = es.name
+                        for s in es.shifts:
+                            sched_map[(es.emp_id, s.date)] = (s.code, s.name)
+                except Exception:
+                    pass
+                cur = (cur.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+            return punch_rows, sched_map, emp_names, start, end
 
-        def done(rows):
-            self._populate_punch(rows)
+        def done(result):
+            punch_rows, sched_map, emp_names, s, e = result
+            self._populate_punch(punch_rows, sched_map, emp_names, s, e)
             scope = "全員" if self.p_all.get() else (emp or "")
-            self._set_status(f"打卡 {start}~{end}({scope}) 共 {len(rows)} 筆")
+            self._set_status(f"打卡 {start}~{end}({scope}) 共 {len(punch_rows)} 筆")
 
         self._run_async(work, done)
 
-    def _populate_punch(self, rows) -> None:
-        tv = self.punch_tv
-        tv.delete(*tv.get_children())
-        for r in rows:
-            tv.insert(
-                "",
-                "end",
-                values=(
-                    r.get("員工代號", ""),
-                    r.get("員工姓名", ""),
-                    str(r.get("出勤日期", ""))[:10],
-                    str(r.get("刷卡時間", ""))[11:16],
-                    r.get("來源", ""),
-                    r.get("卡鐘代號", ""),
-                ),
-            )
+    def _populate_punch(
+        self,
+        rows,
+        sched_map: dict | None = None,
+        emp_names: dict | None = None,
+        range_start: str | None = None,
+        range_end: str | None = None,
+    ) -> None:
+        # 1. 整理有打卡的日子
+        sorted_rows = sorted(rows, key=lambda r: (
+            r.get("員工代號", ""),
+            str(r.get("出勤日期", ""))[:10],
+            str(r.get("刷卡時間", "")),
+        ))
+        display: list[tuple] = []
+        punched: set[tuple] = set()
+        for (emp_id, date), grp in groupby(sorted_rows, key=lambda r: (
+            r.get("員工代號", ""), str(r.get("出勤日期", ""))[:10]
+        )):
+            punched.add((emp_id, date))
+            group = list(grp)
+            name = group[0].get("員工姓名", "")
+            code, _ = (sched_map or {}).get((emp_id, date), ("", ""))
+            sched_in, sched_out = _shift_times(code) if code else ("", "")
+            punches = [str(r.get("刷卡時間", ""))[11:16] for r in group]
+            if len(punches) == 1:
+                clock_in, clock_out = _assign_single_punch(punches[0], sched_in, sched_out)
+            else:
+                clock_in, clock_out = _split_punches(punches, sched_in, sched_out)
+            remark = _punch_remark(clock_in, clock_out, sched_in, sched_out)
+            display.append((emp_id, name, date, code, sched_in, sched_out, clock_in, clock_out, remark))
+
+        # 2. 找出有排班但完全沒打卡的日子 → 曠職
+        if sched_map and range_start and range_end:
+            start_d = dt.date.fromisoformat(range_start)
+            end_d   = dt.date.fromisoformat(range_end)
+            for (emp_id, date), (code, _) in sched_map.items():
+                if code in _REST_CODES:
+                    continue
+                d = dt.date.fromisoformat(date)
+                if start_d <= d <= end_d and (emp_id, date) not in punched:
+                    name = (emp_names or {}).get(emp_id, "")
+                    sched_in, sched_out = _shift_times(code) if code else ("", "")
+                    display.append((emp_id, name, date, code, sched_in, sched_out, "", "", "曠職"))
+
+        RED = "#CC0000"
+        def _fgs(row: tuple) -> tuple:
+            remark = row[8]
+            ci_red = RED if remark and any(k in remark for k in ("遲到", "上班忘打卡", "曠職")) else ""
+            co_red = RED if remark and any(k in remark for k in ("早退", "下班忘打卡", "曠職")) else ""
+            rm_red = RED if remark else ""
+            return ("", "", "", "", "", "", ci_red, co_red, rm_red)
+
+        self._punch_cache = [
+            (row, _fgs(row))
+            for row in sorted(display, key=lambda x: (x[0], x[2]))
+        ]
+        self._apply_punch_filter()
+
+    def _apply_punch_filter(self) -> None:
+        only_abnormal = self.p_abnormal.get()
+        filtered = [
+            (vals, fgs) for vals, fgs in self._punch_cache
+            if not only_abnormal or any(fgs)
+        ]
+        self.punch_tbl.populate(filtered)
 
 
 def main() -> None:
