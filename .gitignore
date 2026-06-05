@@ -1,0 +1,20 @@
+# 機敏:含 live session token / 帳密
+jar.txt
+*.cookie
+.env
+.env.*
+
+# 文中前端原始下載檔(proprietary,僅供反查參考,不入庫)
+login.js
+webm1031.index.js
+*.index.js
+
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS / 編輯器
+.DS_Store
+.claude/
+.idea/
+.vscode/
