@@ -1330,8 +1330,13 @@ class EhrsApp(ctk.CTk):
     def _apply_set(self, emp, date_str: str, code: str) -> None:
         year, month, _ = (int(x) for x in date_str.split("-"))
         self._set_status("寫入中…")
-        # 排班一律 kind=3；只有排休（991）才讓系統自動偵測 kind
-        kind = None if _is_rest(code) else 3
+        # 保留該員工當天現有班別的日種類（pb29004），避免誤把「休息日/例假」改成「工作日」。
+        # 排休(991) 用 None 讓 server 自動偵測；一般班別先看舊班的 kind，找不到才預設 3。
+        if _is_rest(code):
+            kind = None
+        else:
+            cur = emp.shift_on(date_str)
+            kind = (cur.kind if cur is not None and cur.kind is not None else 3)
 
         def work():
             return self.client.set_shift(
@@ -2017,10 +2022,23 @@ class EhrsApp(ctk.CTk):
         year, month, _ = (int(x) for x in date_str.split("-"))
         self._set_status(f"套用中：{emp_id} {date_str} → {code}…")
 
+        # 從已載入的班表取得該員工當天的日種類（pb29004），
+        # 確保排班/例假/休息日類型不被更動，只替換班別代號。
+        if _is_rest(code):
+            kind: int | None = None
+        else:
+            kind = 3  # 預設工作日
+            for emp_obj in (self.schedule or []):
+                if emp_obj.emp_id == emp_id:
+                    cur = emp_obj.shift_on(date_str)
+                    if cur is not None and cur.kind is not None:
+                        kind = cur.kind
+                    break
+
         def work():
             return self.client.set_shift(
                 year, month, emp_id, date_str, code,
-                kind=None if _is_rest(code) else 3,
+                kind=kind,
                 dry_run=False,
             )
 
