@@ -30,6 +30,22 @@ from version import __version__
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
+# ─── UI 色彩字典（參考 HTML 設計稿配色）────────────────────────────────────────
+_C = {
+    "accent":  "#4A6FE3",   # 主色：靛藍
+    "acc_h":   "#3B5DD0",   # 主色 hover
+    "ink":     "#2D3048",   # 主文字：深藍灰
+    "muted":   "#7B8097",   # 次文字：中灰
+    "app_bg":  "#F5F7FB",   # 應用底色：極淡藍灰
+    "tab_bg":  "#ECEEF5",   # 分頁列容器
+    "line":    "#E8EBF4",   # 邊框 / 分隔線
+    "white":   "#FFFFFF",
+    "tbl_hdr": "#EEF2FB",   # 表格表頭
+    "row_alt": "#F8F9FD",   # 隔行底色
+    "red":     "#CC2200",
+    "green":   "#2A8B5A",
+}
+
 _WEEK = "一二三四五六日"
 
 
@@ -194,13 +210,13 @@ class _PunchTable(tk.Frame):
         ("排班代號",  70), ("表定上班",  80), ("表定下班",  80),
         ("實際上班",  80), ("實際下班",  80), ("備注",     140),
     ]
-    ROW_H  = 23
-    HDR_H  = 28
-    FONT   = ("TkDefaultFont", 11)
-    BFONT  = ("TkDefaultFont", 11, "bold")
-    HDR_BG = "#D9E1F2"
-    BG     = ("#FFFFFF", "#F5F5F5")
-    GRID   = "#DDDDDD"
+    ROW_H  = 27
+    HDR_H  = 32
+    FONT   = ("TkDefaultFont", 12)
+    BFONT  = ("TkDefaultFont", 12, "bold")
+    HDR_BG = "#EEF2FB"
+    BG     = ("#FFFFFF", "#F8F9FD")
+    GRID   = "#E8EBF4"
 
     def __init__(self, parent, **kw):
         super().__init__(parent, **kw)
@@ -225,7 +241,8 @@ class _PunchTable(tk.Frame):
             self._cv.create_rectangle(x, 0, x+w, self.HDR_H,
                                       fill=self.HDR_BG, outline=self.GRID)
             self._cv.create_text(x + w//2, self.HDR_H//2,
-                                 text=name, font=self.BFONT, anchor="center")
+                                 text=name, font=self.BFONT, fill="#2D3048",
+                                 anchor="center")
             x += w
 
     def populate(self, rows: list[tuple]) -> None:
@@ -256,7 +273,8 @@ class EhrsApp(ctk.CTk):
     def __init__(self, auto_login: bool = True) -> None:
         super().__init__()
         self.title(f"文中排班工具  v{__version__}")
-        self.geometry("1180x700")
+        self.geometry("1180x720")
+        self.configure(fg_color=_C["app_bg"])
 
         self.client: EhrsClient | None = None
         self.account: str = ""
@@ -273,8 +291,65 @@ class EhrsApp(ctk.CTk):
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
-        self.tabview = ctk.CTkTabview(self)
-        self.tabview.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+        # ── 設定 ttk 樣式（排班格 + 打卡紀錄用的 Treeview）──────────
+        style = ttk.Style()
+        style.configure("App.Treeview.Heading",
+                         background=_C["tbl_hdr"], foreground=_C["ink"],
+                         font=("TkDefaultFont", 12, "bold"), relief="flat")
+        style.configure("App.Treeview",
+                         rowheight=28, background=_C["white"],
+                         foreground=_C["ink"], fieldbackground=_C["white"],
+                         borderwidth=0)
+        style.map("App.Treeview",
+                  background=[("selected", _C["accent"])],
+                  foreground=[("selected", "#FFFFFF")])
+        # 去掉 Heading 的 relief border
+        style.layout("App.Treeview.Heading", [
+            ("Treeheading.cell", {"sticky": "nswe"}),
+            ("Treeheading.border", {"sticky": "nswe", "children": [
+                ("Treeheading.padding", {"sticky": "nswe", "children": [
+                    ("Treeheading.label", {"sticky": "nswe"})
+                ]})
+            ]}),
+        ])
+
+        # ── 頂部品牌列 ─────────────────────────────────────────────
+        hdr = ctk.CTkFrame(self, fg_color=_C["white"], corner_radius=0,
+                            height=54, border_width=0)
+        hdr.pack(fill="x", side="top")
+        hdr.pack_propagate(False)
+        # 底線
+        tk.Frame(hdr, bg=_C["line"], height=1).pack(side="bottom", fill="x")
+
+        # Logo 方塊
+        logo = ctk.CTkFrame(hdr, fg_color=_C["accent"], width=34, height=34,
+                              corner_radius=9)
+        logo.pack(side="left", padx=(16, 10), pady=10)
+        logo.pack_propagate(False)
+        ctk.CTkLabel(logo, text="文", font=("", 18, "bold"),
+                      text_color="#FFFFFF").pack(expand=True)
+
+        ctk.CTkLabel(hdr, text="文中排班",
+                      font=("", 16, "bold"), text_color=_C["ink"]).pack(side="left")
+        ctk.CTkLabel(hdr, text=f"v{__version__}",
+                      font=("", 11), text_color=_C["muted"]).pack(
+            side="left", padx=(5, 0), pady=(7, 0))
+
+        # ── 分頁 ───────────────────────────────────────────────────
+        self.tabview = ctk.CTkTabview(
+            self,
+            fg_color=_C["white"],
+            segmented_button_fg_color=_C["tab_bg"],
+            segmented_button_selected_color=_C["white"],
+            segmented_button_selected_hover_color=_C["white"],
+            segmented_button_unselected_color=_C["tab_bg"],
+            segmented_button_unselected_hover_color="#DDDFE8",
+            text_color=_C["accent"],
+            text_color_disabled=_C["muted"],
+            border_color=_C["line"],
+            border_width=1,
+        )
+        self.tabview.pack(fill="both", expand=True, padx=10, pady=(8, 4))
         self._build_schedule_tab(self.tabview.add("排班"))
         self._build_punch_tab(self.tabview.add("打卡"))
         self._build_raw_punch_tab(self.tabview.add("打卡紀錄"))
@@ -282,44 +357,70 @@ class EhrsApp(ctk.CTk):
         self._build_settings_tab(self.tabview.add("設定"))
 
         # ── 底部 status bar（含匯入進度條）─────────────────────────
-        btm = ctk.CTkFrame(self, fg_color="transparent")
-        btm.pack(side="bottom", fill="x", padx=12, pady=(0, 8))
+        btm = ctk.CTkFrame(self, fg_color=_C["white"], height=36,
+                            corner_radius=0, border_width=0)
+        btm.pack(side="bottom", fill="x")
+        btm.pack_propagate(False)
+        # 頂線
+        tk.Frame(btm, bg=_C["line"], height=1).pack(side="top", fill="x")
 
-        self.status = ctk.CTkLabel(btm, text="就緒", anchor="w")
-        self.status.pack(side="left", fill="x", expand=True)
+        # 狀態指示燈
+        self._status_dot = ctk.CTkLabel(btm, text="●", font=("", 10),
+                                          text_color=_C["muted"], width=16)
+        self._status_dot.pack(side="left", padx=(14, 0))
+
+        self.status = ctk.CTkLabel(btm, text="就緒", anchor="w",
+                                     text_color=_C["muted"], font=("", 12))
+        self.status.pack(side="left", fill="x", expand=True, padx=(4, 0))
 
         # 進度條區塊（平時隱藏，匯入時顯示）
         self._prog_frm = ctk.CTkFrame(btm, fg_color="transparent")
-        self._prog_bar = ctk.CTkProgressBar(self._prog_frm, width=200, height=14)
+        self._prog_bar = ctk.CTkProgressBar(self._prog_frm, width=180, height=12,
+                                              progress_color=_C["accent"],
+                                              fg_color=_C["line"])
         self._prog_bar.set(0)
         self._prog_bar.pack(side="left", padx=(0, 6))
-        self._prog_lbl = ctk.CTkLabel(self._prog_frm, text="", width=70, anchor="e")
+        self._prog_lbl = ctk.CTkLabel(self._prog_frm, text="", width=70,
+                                        anchor="e", font=("", 12),
+                                        text_color=_C["muted"])
         self._prog_lbl.pack(side="left")
 
     def _build_schedule_tab(self, tab) -> None:
-        bar = ctk.CTkFrame(tab)
+        bar = ctk.CTkFrame(tab, fg_color=_C["white"], corner_radius=8,
+                            border_width=1, border_color=_C["line"])
         bar.pack(fill="x", padx=6, pady=6)
         now = dt.date.today()
         self.year_var = ctk.StringVar(value=str(now.year))
         self.month_var = ctk.StringVar(value=str(now.month))
-        ctk.CTkLabel(bar, text="年").pack(side="left", padx=(8, 2))
-        ctk.CTkEntry(bar, textvariable=self.year_var, width=70).pack(side="left")
-        ctk.CTkLabel(bar, text="月").pack(side="left", padx=(10, 2))
-        ctk.CTkEntry(bar, textvariable=self.month_var, width=50).pack(side="left")
-        ctk.CTkButton(bar, text="載入排班", command=self._load_schedule).pack(
-            side="left", padx=12
-        )
-        ctk.CTkLabel(bar, text="提示:雙擊格子可改班/刪班").pack(side="left", padx=8)
-        ctk.CTkButton(
-            bar, text="匯出 Excel", width=100, command=self._export_schedule
-        ).pack(side="right", padx=4)
-        ctk.CTkButton(
-            bar, text="匯入 Excel", width=100, command=self._import_schedule
-        ).pack(side="right", padx=4)
+        ctk.CTkLabel(bar, text="年", text_color=_C["ink"],
+                      font=("", 13)).pack(side="left", padx=(12, 2))
+        ctk.CTkEntry(bar, textvariable=self.year_var, width=70,
+                      border_color=_C["line"], fg_color=_C["white"],
+                      text_color=_C["ink"]).pack(side="left")
+        ctk.CTkLabel(bar, text="月", text_color=_C["ink"],
+                      font=("", 13)).pack(side="left", padx=(10, 2))
+        ctk.CTkEntry(bar, textvariable=self.month_var, width=50,
+                      border_color=_C["line"], fg_color=_C["white"],
+                      text_color=_C["ink"]).pack(side="left")
+        ctk.CTkButton(bar, text="載入排班",
+                       fg_color=_C["accent"], hover_color=_C["acc_h"],
+                       corner_radius=8, font=("", 13, "bold"),
+                       command=self._load_schedule).pack(side="left", padx=12, pady=6)
+        ctk.CTkLabel(bar, text="雙擊格子可改班 / 刪班",
+                      text_color=_C["muted"], font=("", 12)).pack(side="left", padx=4)
+        ctk.CTkButton(bar, text="匯出 Excel", width=100,
+                       fg_color=_C["muted"], hover_color="#6B7280",
+                       corner_radius=8, command=self._export_schedule
+                       ).pack(side="right", padx=6, pady=6)
+        ctk.CTkButton(bar, text="匯入 Excel", width=100,
+                       fg_color=_C["muted"], hover_color="#6B7280",
+                       corner_radius=8, command=self._import_schedule
+                       ).pack(side="right", padx=(4, 0), pady=6)
 
-        wrap = tk.Frame(tab)
+        wrap = tk.Frame(tab, bg=_C["app_bg"])
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-        self.grid_tv = ttk.Treeview(wrap, show="headings", height=18)
+        self.grid_tv = ttk.Treeview(wrap, style="App.Treeview",
+                                     show="headings", height=18)
         ysb = ttk.Scrollbar(wrap, orient="vertical", command=self.grid_tv.yview)
         xsb = ttk.Scrollbar(wrap, orient="horizontal", command=self.grid_tv.xview)
         self.grid_tv.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
@@ -331,41 +432,53 @@ class EhrsApp(ctk.CTk):
         self.grid_tv.bind("<Double-1>", self._on_grid_double)
 
     def _build_punch_tab(self, tab) -> None:
-        bar = ctk.CTkFrame(tab)
+        _btn_outline = dict(fg_color=_C["white"], text_color=_C["ink"],
+                             hover_color=_C["tab_bg"], border_width=1,
+                             border_color=_C["line"], corner_radius=8)
+        bar = ctk.CTkFrame(tab, fg_color=_C["white"], corner_radius=8,
+                            border_width=1, border_color=_C["line"])
         bar.pack(fill="x", padx=6, pady=6)
         today = dt.date.today()
-        self.p_start = ctk.CTkEntry(bar, width=110)
+        self.p_start = ctk.CTkEntry(bar, width=110, border_color=_C["line"],
+                                      fg_color=_C["white"], text_color=_C["ink"])
         self.p_start.insert(0, today.replace(day=1).isoformat())
-        self.p_end = ctk.CTkEntry(bar, width=110)
+        self.p_end = ctk.CTkEntry(bar, width=110, border_color=_C["line"],
+                                    fg_color=_C["white"], text_color=_C["ink"])
         self.p_end.insert(0, today.isoformat())
         self._selected_emps: set[str] = set()    # empty = 全員
         self._selected_depts: set[str] = set()   # empty = 全部門
         self._emp_dept: dict[str, str] = {}      # emp_id -> 部門名稱
         self.p_dept_btn = ctk.CTkButton(
-            bar, text="部門：全部 ▼", width=130, fg_color="#5B7FA6",
+            bar, text="部門：全部 ▼", width=130, **_btn_outline,
             command=self._open_dept_picker
         )
         self.p_emp_btn = ctk.CTkButton(
-            bar, text="員工：全員 ▼", width=130, fg_color="#5B7FA6",
+            bar, text="員工：全員 ▼", width=130, **_btn_outline,
             command=self._open_emp_picker
         )
-        self.p_abnormal = ctk.CTkCheckBox(bar, text="只顯示異常", command=self._apply_punch_filter)
+        self.p_abnormal = ctk.CTkCheckBox(bar, text="只顯示異常",
+                                            text_color=_C["ink"],
+                                            command=self._apply_punch_filter)
         self.p_abnormal.select()
-        ctk.CTkLabel(bar, text="起").pack(side="left", padx=(8, 2))
-        self.p_start.pack(side="left")
-        ctk.CTkLabel(bar, text="迄").pack(side="left", padx=(10, 2))
-        self.p_end.pack(side="left")
-        self.p_dept_btn.pack(side="left", padx=(10, 0))
-        self.p_emp_btn.pack(side="left", padx=(6, 0))
+        ctk.CTkLabel(bar, text="起", text_color=_C["ink"],
+                      font=("", 13)).pack(side="left", padx=(12, 2))
+        self.p_start.pack(side="left", pady=6)
+        ctk.CTkLabel(bar, text="迄", text_color=_C["ink"],
+                      font=("", 13)).pack(side="left", padx=(10, 2))
+        self.p_end.pack(side="left", pady=6)
+        self.p_dept_btn.pack(side="left", padx=(10, 0), pady=6)
+        self.p_emp_btn.pack(side="left", padx=(6, 0), pady=6)
         self.p_abnormal.pack(side="left", padx=10)
-        ctk.CTkButton(bar, text="查詢打卡", command=self._query_punch).pack(
-            side="left", padx=12
-        )
-        ctk.CTkButton(
-            bar, text="匯出 Excel", width=100, command=self._export_punch
-        ).pack(side="right", padx=4)
+        ctk.CTkButton(bar, text="查詢打卡",
+                       fg_color=_C["accent"], hover_color=_C["acc_h"],
+                       corner_radius=8, font=("", 13, "bold"),
+                       command=self._query_punch).pack(side="left", padx=12, pady=6)
+        ctk.CTkButton(bar, text="匯出 Excel", width=100,
+                       fg_color=_C["muted"], hover_color="#6B7280",
+                       corner_radius=8, command=self._export_punch
+                       ).pack(side="right", padx=6, pady=6)
 
-        wrap = tk.Frame(tab)
+        wrap = tk.Frame(tab, bg=_C["app_bg"])
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.punch_tbl = _PunchTable(wrap)
         self.punch_tbl.grid(row=0, column=0, sticky="nsew")
@@ -373,33 +486,40 @@ class EhrsApp(ctk.CTk):
         wrap.columnconfigure(0, weight=1)
 
     def _build_raw_punch_tab(self, tab) -> None:
-        bar = ctk.CTkFrame(tab)
+        _btn_outline = dict(fg_color=_C["white"], text_color=_C["ink"],
+                             hover_color=_C["tab_bg"], border_width=1,
+                             border_color=_C["line"], corner_radius=8)
+        bar = ctk.CTkFrame(tab, fg_color=_C["white"], corner_radius=8,
+                            border_width=1, border_color=_C["line"])
         bar.pack(fill="x", padx=6, pady=6)
 
         self._raw_selected_depts: set[str] = set()
         self._raw_selected_emps:  set[str] = set()
 
         self.raw_dept_btn = ctk.CTkButton(
-            bar, text="部門：全部 ▼", width=130, fg_color="#5B7FA6",
+            bar, text="部門：全部 ▼", width=130, **_btn_outline,
             command=self._open_raw_dept_picker
         )
         self.raw_emp_btn = ctk.CTkButton(
-            bar, text="員工：全員 ▼", width=130, fg_color="#5B7FA6",
+            bar, text="員工：全員 ▼", width=130, **_btn_outline,
             command=self._open_raw_emp_picker
         )
-        self.raw_count_lbl = ctk.CTkLabel(bar, text="共 0 筆", text_color="gray")
+        self.raw_count_lbl = ctk.CTkLabel(bar, text="共 0 筆",
+                                            text_color=_C["muted"], font=("", 12))
 
-        self.raw_dept_btn.pack(side="left", padx=(8, 0))
-        self.raw_emp_btn.pack(side="left", padx=(6, 0))
+        self.raw_dept_btn.pack(side="left", padx=(12, 0), pady=6)
+        self.raw_emp_btn.pack(side="left", padx=(6, 0), pady=6)
         self.raw_count_lbl.pack(side="left", padx=10)
-        ctk.CTkButton(
-            bar, text="匯出 Excel", width=100, command=self._export_raw_punch
-        ).pack(side="right", padx=4)
+        ctk.CTkButton(bar, text="匯出 Excel", width=100,
+                       fg_color=_C["muted"], hover_color="#6B7280",
+                       corner_radius=8, command=self._export_raw_punch
+                       ).pack(side="right", padx=6, pady=6)
 
-        wrap = tk.Frame(tab)
+        wrap = tk.Frame(tab, bg=_C["app_bg"])
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         cols = ("dept", "emp_id", "emp_name", "date", "time", "jiezhuan", "source")
-        self.raw_tv = ttk.Treeview(wrap, columns=cols, show="headings", height=20)
+        self.raw_tv = ttk.Treeview(wrap, style="App.Treeview",
+                                    columns=cols, show="headings", height=20)
         for col, lbl, w in [
             ("dept",      "部門",   90),
             ("emp_id",    "員工代號", 80),
@@ -502,7 +622,8 @@ class EhrsApp(ctk.CTk):
         """通用多選清單彈窗。"""
         top = ctk.CTkToplevel(self)
         top.title(title)
-        top.geometry("260x440")
+        top.geometry("280x460")
+        top.configure(fg_color=_C["app_bg"])
         top.resizable(False, True)
         top.transient(self)
         top.after(60, top.grab_set)
@@ -510,18 +631,25 @@ class EhrsApp(ctk.CTk):
         search_var = ctk.StringVar()
         if searchable:
             ctk.CTkEntry(top, placeholder_text="搜尋…",
-                         textvariable=search_var).pack(fill="x", padx=12, pady=(12, 4))
+                          textvariable=search_var,
+                          border_color=_C["line"], fg_color=_C["white"],
+                          text_color=_C["ink"]).pack(
+                fill="x", padx=12, pady=(12, 4))
 
-        scroll = ctk.CTkScrollableFrame(top, fg_color="transparent")
-        scroll.pack(fill="both", expand=True, padx=8, pady=(8 if not searchable else 0, 0))
+        scroll = ctk.CTkScrollableFrame(top, fg_color=_C["white"],
+                                          corner_radius=8,
+                                          border_width=1, border_color=_C["line"])
+        scroll.pack(fill="both", expand=True, padx=12,
+                     pady=(8 if not searchable else 4, 0))
 
         chk_vars: dict[str, tk.BooleanVar] = {}
         chk_widgets: dict[str, ctk.CTkCheckBox] = {}
         for item in items:
             init = (not selected) or (item in selected)
             var = tk.BooleanVar(value=init)
-            chk = ctk.CTkCheckBox(scroll, text=item, variable=var)
-            chk.pack(anchor="w", padx=4, pady=2)
+            chk = ctk.CTkCheckBox(scroll, text=item, variable=var,
+                                   text_color=_C["ink"])
+            chk.pack(anchor="w", padx=4, pady=3)
             chk_vars[item] = var
             chk_widgets[item] = chk
 
@@ -530,19 +658,23 @@ class EhrsApp(ctk.CTk):
                 q = search_var.get().lower()
                 for it, w in chk_widgets.items():
                     if not q or q in it.lower():
-                        w.pack(anchor="w", padx=4, pady=2)
+                        w.pack(anchor="w", padx=4, pady=3)
                     else:
                         w.pack_forget()
             search_var.trace_add("write", _filter)
 
         btn_bar = ctk.CTkFrame(top, fg_color="transparent")
-        btn_bar.pack(fill="x", padx=8, pady=(4, 0))
+        btn_bar.pack(fill="x", padx=12, pady=(6, 0))
         ctk.CTkButton(btn_bar, text="全選", width=80,
-                      command=lambda: [v.set(True)  for v in chk_vars.values()]
-                      ).pack(side="left", padx=4)
-        ctk.CTkButton(btn_bar, text="清除", width=80, fg_color="gray",
-                      command=lambda: [v.set(False) for v in chk_vars.values()]
-                      ).pack(side="left", padx=4)
+                       fg_color=_C["tab_bg"], text_color=_C["ink"],
+                       hover_color=_C["line"], corner_radius=8,
+                       command=lambda: [v.set(True)  for v in chk_vars.values()]
+                       ).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(btn_bar, text="清除", width=80,
+                       fg_color=_C["tab_bg"], text_color=_C["ink"],
+                       hover_color=_C["line"], corner_radius=8,
+                       command=lambda: [v.set(False) for v in chk_vars.values()]
+                       ).pack(side="left")
 
         def apply():
             picked = {it for it, v in chk_vars.items() if v.get()}
@@ -550,8 +682,10 @@ class EhrsApp(ctk.CTk):
             on_confirm(final)
             top.destroy()
 
-        ctk.CTkButton(top, text="確定", command=apply).pack(
-            fill="x", padx=12, pady=8)
+        ctk.CTkButton(top, text="確定",
+                       fg_color=_C["accent"], hover_color=_C["acc_h"],
+                       corner_radius=9, font=("", 13, "bold"),
+                       command=apply).pack(fill="x", padx=12, pady=10)
 
     def _export_raw_punch(self) -> None:
         rows = list(self.raw_tv.get_children())
@@ -583,34 +717,80 @@ class EhrsApp(ctk.CTk):
         self._set_status(f"已匯出打卡紀錄 → {path}")
 
     def _build_settings_tab(self, tab) -> None:
-        frm = ctk.CTkFrame(tab)
-        frm.pack(padx=20, pady=20, anchor="nw")
-        ctk.CTkLabel(frm, text="帳號").grid(row=0, column=0, sticky="e", padx=8, pady=8)
-        self.s_acc = ctk.CTkEntry(frm, width=240)
-        self.s_acc.insert(0, self.cfg.get("account", ""))
-        self.s_acc.grid(row=0, column=1, pady=8)
-        ctk.CTkLabel(frm, text="密碼").grid(row=1, column=0, sticky="e", padx=8, pady=8)
-        self.s_pwd = ctk.CTkEntry(frm, width=240, show="*")
-        self.s_pwd.insert(0, self.cfg.get("password", ""))
-        self.s_pwd.grid(row=1, column=1, pady=8)
-        ctk.CTkLabel(frm, text="站台網址").grid(
-            row=2, column=0, sticky="e", padx=8, pady=8
-        )
-        self.s_base = ctk.CTkEntry(frm, width=360)
-        self.s_base.insert(0, self.cfg.get("base_url", DEFAULT_BASE_URL))
-        self.s_base.grid(row=2, column=1, pady=8)
-        ctk.CTkButton(frm, text="儲存並登入", command=self._save_and_login).grid(
-            row=3, column=1, sticky="w", pady=12
-        )
-        ctk.CTkLabel(
-            frm,
-            text="帳密只存在本機 ~/.ehrs_tool/config.json(限本人讀取)",
-            text_color="gray",
-        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=8)
+        # 垂直置中：上下各放一個彈性區塊
+        ctk.CTkFrame(tab, fg_color="transparent").pack(fill="both", expand=True)
+
+        card = ctk.CTkFrame(tab, fg_color=_C["white"], corner_radius=14,
+                             border_width=1, border_color=_C["line"])
+        card.pack(padx=60, anchor="center")
+
+        # ── 卡片標題 ──────────────────────────────────────────
+        hdr_row = ctk.CTkFrame(card, fg_color="transparent")
+        hdr_row.pack(fill="x", padx=28, pady=(24, 0))
+
+        icon_box = ctk.CTkFrame(hdr_row, fg_color=_C["tab_bg"],
+                                  width=46, height=46, corner_radius=12)
+        icon_box.pack(side="left", padx=(0, 14))
+        icon_box.pack_propagate(False)
+        ctk.CTkLabel(icon_box, text="⚙", font=("", 20),
+                      text_color=_C["accent"]).pack(expand=True)
+
+        title_col = ctk.CTkFrame(hdr_row, fg_color="transparent")
+        title_col.pack(side="left")
+        ctk.CTkLabel(title_col, text="連線設定",
+                      font=("", 17, "bold"), text_color=_C["ink"],
+                      anchor="w").pack(anchor="w")
+        ctk.CTkLabel(title_col, text="帳密只存本機 ~/.ehrs_tool，不會上傳",
+                      font=("", 12), text_color=_C["muted"],
+                      anchor="w").pack(anchor="w")
+
+        # 分隔線
+        tk.Frame(card, bg=_C["line"], height=1).pack(fill="x", pady=(18, 0))
+
+        # ── 表單 ──────────────────────────────────────────────
+        form = ctk.CTkFrame(card, fg_color="transparent")
+        form.pack(fill="x", padx=28, pady=(18, 26))
+
+        def _field(label: str, attr: str, default: str, **kw) -> None:
+            ctk.CTkLabel(form, text=label,
+                          font=("", 13, "bold"), text_color=_C["ink"],
+                          anchor="w").pack(anchor="w", pady=(0, 4))
+            ent = ctk.CTkEntry(form, width=400, height=42, corner_radius=9,
+                                border_color=_C["line"], fg_color=_C["white"],
+                                text_color=_C["ink"], font=("", 13), **kw)
+            ent.insert(0, default)
+            ent.pack(anchor="w", pady=(0, 14))
+            setattr(self, attr, ent)
+
+        _field("帳號",   "s_acc",  self.cfg.get("account",  ""))
+        _field("密碼",   "s_pwd",  self.cfg.get("password", ""), show="*")
+        _field("站台網址", "s_base", self.cfg.get("base_url", DEFAULT_BASE_URL))
+
+        ctk.CTkButton(
+            form, text="儲存並登入", width=400, height=44,
+            fg_color=_C["accent"], hover_color=_C["acc_h"],
+            corner_radius=10, font=("", 14, "bold"),
+            command=self._save_and_login,
+        ).pack(anchor="w")
+
+        ctk.CTkFrame(tab, fg_color="transparent").pack(fill="both", expand=True)
 
     # -------------------------------------------------------------- helpers
     def _set_status(self, text: str) -> None:
         self.status.configure(text=text)
+        if not hasattr(self, "_status_dot"):
+            return
+        # 依訊息內容切換狀態燈顏色
+        if any(k in text for k in ("錯誤", "失敗")):
+            dot_clr = _C["red"]
+        elif any(k in text for k in ("完成", "已載入", "已登入", "已匯出",
+                                      "已寫入", "已刪除", "已套用", "安裝完成")):
+            dot_clr = _C["green"]
+        elif any(k in text for k in ("中…", "查詢", "載入", "匯入", "下載")):
+            dot_clr = _C["accent"]
+        else:
+            dot_clr = _C["muted"]
+        self._status_dot.configure(text_color=dot_clr)
 
     def _show_progress(self, done: int, total: int) -> None:
         """顯示匯入進度條（在主執行緒呼叫）。"""
@@ -765,16 +945,25 @@ class EhrsApp(ctk.CTk):
 
         top = ctk.CTkToplevel(self)
         top.title("編輯排班")
-        top.geometry("380x460")
+        top.geometry("400x480")
+        top.configure(fg_color=_C["app_bg"])
         top.transient(self)
         top.after(60, top.grab_set)
 
-        ctk.CTkLabel(
-            top, text=f"{emp.emp_id} {emp.name}", font=("", 16, "bold")
-        ).pack(pady=(18, 2))
-        ctk.CTkLabel(top, text=date_str).pack()
-        cur_txt = f"目前:{cur.code} {cur.name}" if cur else "目前:(空白)"
-        ctk.CTkLabel(top, text=cur_txt, text_color="gray").pack(pady=6)
+        # 員工資訊列
+        hdr_row = ctk.CTkFrame(top, fg_color=_C["white"], corner_radius=10,
+                                 border_width=1, border_color=_C["line"])
+        hdr_row.pack(fill="x", padx=16, pady=(16, 0))
+        ctk.CTkLabel(hdr_row, text=f"{emp.emp_id} {emp.name}",
+                      font=("", 15, "bold"), text_color=_C["ink"]).pack(
+            side="left", padx=14, pady=10)
+        ctk.CTkLabel(hdr_row, text=date_str,
+                      font=("", 13), text_color=_C["muted"]).pack(
+            side="left", padx=4)
+        cur_txt = f"目前：{cur.code} {cur.name}" if cur else "目前：（空白）"
+        ctk.CTkLabel(hdr_row, text=cur_txt,
+                      font=("", 12), text_color=_C["muted"]).pack(
+            side="right", padx=14)
 
         # 預先計算所有班別的上班/下班/時數
         opt_rows: list[tuple[str, str, str, str]] = []  # (code, start, end, hours)
@@ -784,20 +973,22 @@ class EhrsApp(ctk.CTk):
             h_str = f"{h:g}" if h else ""
             opt_rows.append((c, si, so, h_str))
 
-        entry = ctk.CTkEntry(top, width=360, placeholder_text="輸入班別代號…")
-        entry.pack(pady=(4, 2), padx=20)
+        entry = ctk.CTkEntry(top, width=368, placeholder_text="輸入班別代號…",
+                               border_color=_C["line"], fg_color=_C["white"],
+                               text_color=_C["ink"])
+        entry.pack(pady=(10, 4), padx=16)
         if cur:
             entry.insert(0, cur.code)
 
-        tv_wrap = tk.Frame(top)
-        tv_wrap.pack(fill="x", padx=20, pady=(0, 4))
-        tv = ttk.Treeview(tv_wrap,
-                          columns=("code", "start", "end", "hours"),
-                          show="headings", height=10, selectmode="browse")
-        tv.heading("code",  text="班別代號"); tv.column("code",  width=85, anchor="center")
-        tv.heading("start", text="上班時間"); tv.column("start", width=80, anchor="center")
-        tv.heading("end",   text="下班時間"); tv.column("end",   width=80, anchor="center")
-        tv.heading("hours", text="時數");     tv.column("hours", width=55, anchor="center")
+        tv_wrap = tk.Frame(top, bg=_C["app_bg"])
+        tv_wrap.pack(fill="x", padx=16, pady=(0, 4))
+        tv = ttk.Treeview(tv_wrap, style="App.Treeview",
+                           columns=("code", "start", "end", "hours"),
+                           show="headings", height=10, selectmode="browse")
+        tv.heading("code",  text="班別代號"); tv.column("code",  width=90, anchor="center")
+        tv.heading("start", text="上班時間"); tv.column("start", width=85, anchor="center")
+        tv.heading("end",   text="下班時間"); tv.column("end",   width=85, anchor="center")
+        tv.heading("hours", text="時數");     tv.column("hours", width=60, anchor="center")
         sb = ttk.Scrollbar(tv_wrap, orient="vertical", command=tv.yview)
         tv.configure(yscrollcommand=sb.set)
         tv.pack(side="left", fill="both", expand=True)
@@ -857,9 +1048,16 @@ class EhrsApp(ctk.CTk):
             else:
                 self._apply_set(emp, date_str, raw.split()[0])
 
-        ctk.CTkButton(top, text="儲存", width=340, command=save).pack(pady=(4, 4), padx=20)
-        ctk.CTkButton(top, text="取消", width=340, fg_color="gray",
-                      command=top.destroy).pack(padx=20)
+        btn_row = ctk.CTkFrame(top, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(0, 16))
+        ctk.CTkButton(btn_row, text="取消", width=170,
+                       fg_color=_C["line"], hover_color="#D0D4E4",
+                       text_color=_C["ink"], corner_radius=9,
+                       command=top.destroy).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(btn_row, text="儲存", width=170,
+                       fg_color=_C["accent"], hover_color=_C["acc_h"],
+                       corner_radius=9, font=("", 13, "bold"),
+                       command=save).pack(side="left")
 
     def _apply_set(self, emp, date_str: str, code: str) -> None:
         year, month, _ = (int(x) for x in date_str.split("-"))
@@ -1215,30 +1413,37 @@ class EhrsApp(ctk.CTk):
 
         top = ctk.CTkToplevel(self)
         top.title("選擇部門")
-        top.geometry("240x380")
+        top.geometry("260x400")
+        top.configure(fg_color=_C["app_bg"])
         top.resizable(False, True)
         top.transient(self)
         top.after(60, top.grab_set)
 
-        scroll = ctk.CTkScrollableFrame(top, fg_color="transparent")
-        scroll.pack(fill="both", expand=True, padx=8, pady=(12, 0))
+        scroll = ctk.CTkScrollableFrame(top, fg_color=_C["white"],
+                                          corner_radius=8,
+                                          border_width=1, border_color=_C["line"])
+        scroll.pack(fill="both", expand=True, padx=12, pady=(12, 0))
 
         chk_vars: dict[str, tk.BooleanVar] = {}
         for dept in depts:
             init = (not self._selected_depts) or (dept in self._selected_depts)
             var = tk.BooleanVar(value=init)
-            ctk.CTkCheckBox(scroll, text=dept, variable=var).pack(
-                anchor="w", padx=4, pady=3)
+            ctk.CTkCheckBox(scroll, text=dept, variable=var,
+                             text_color=_C["ink"]).pack(anchor="w", padx=4, pady=3)
             chk_vars[dept] = var
 
         btn_bar = ctk.CTkFrame(top, fg_color="transparent")
-        btn_bar.pack(fill="x", padx=8, pady=(4, 0))
+        btn_bar.pack(fill="x", padx=12, pady=(6, 0))
         ctk.CTkButton(btn_bar, text="全選", width=80,
-                      command=lambda: [v.set(True) for v in chk_vars.values()]
-                      ).pack(side="left", padx=4)
-        ctk.CTkButton(btn_bar, text="清除", width=80, fg_color="gray",
-                      command=lambda: [v.set(False) for v in chk_vars.values()]
-                      ).pack(side="left", padx=4)
+                       fg_color=_C["tab_bg"], text_color=_C["ink"],
+                       hover_color=_C["line"], corner_radius=8,
+                       command=lambda: [v.set(True) for v in chk_vars.values()]
+                       ).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(btn_bar, text="清除", width=80,
+                       fg_color=_C["tab_bg"], text_color=_C["ink"],
+                       hover_color=_C["line"], corner_radius=8,
+                       command=lambda: [v.set(False) for v in chk_vars.values()]
+                       ).pack(side="left")
 
         def apply():
             selected = {d for d, v in chk_vars.items() if v.get()}
@@ -1247,8 +1452,10 @@ class EhrsApp(ctk.CTk):
             self._apply_punch_filter()
             top.destroy()
 
-        ctk.CTkButton(top, text="確定", command=apply).pack(
-            fill="x", padx=12, pady=8)
+        ctk.CTkButton(top, text="確定",
+                       fg_color=_C["accent"], hover_color=_C["acc_h"],
+                       corner_radius=9, font=("", 13, "bold"),
+                       command=apply).pack(fill="x", padx=12, pady=10)
 
     def _open_emp_picker(self) -> None:
         # 從打卡快取收集所有員工
@@ -1262,7 +1469,8 @@ class EhrsApp(ctk.CTk):
 
         top = ctk.CTkToplevel(self)
         top.title("選擇員工")
-        top.geometry("260x480")
+        top.geometry("280x490")
+        top.configure(fg_color=_C["app_bg"])
         top.resizable(False, True)
         top.transient(self)
         top.after(60, top.grab_set)
@@ -1270,21 +1478,24 @@ class EhrsApp(ctk.CTk):
         # 搜尋框
         search_var = ctk.StringVar()
         ctk.CTkEntry(top, placeholder_text="搜尋員工…",
-                     textvariable=search_var).pack(fill="x", padx=12, pady=(12, 4))
+                      textvariable=search_var,
+                      border_color=_C["line"], fg_color=_C["white"],
+                      text_color=_C["ink"]).pack(fill="x", padx=12, pady=(12, 4))
 
         # 捲動式 checkbox 清單
-        scroll = ctk.CTkScrollableFrame(top, fg_color="transparent")
-        scroll.pack(fill="both", expand=True, padx=8, pady=0)
+        scroll = ctk.CTkScrollableFrame(top, fg_color=_C["white"],
+                                          corner_radius=8,
+                                          border_width=1, border_color=_C["line"])
+        scroll.pack(fill="both", expand=True, padx=12, pady=(4, 0))
 
         chk_vars: dict[str, tk.BooleanVar] = {}
         chk_widgets: dict[str, ctk.CTkCheckBox] = {}
         for eid in sorted(emps):
             init = (not self._selected_emps) or (eid in self._selected_emps)
             var = tk.BooleanVar(value=init)
-            chk = ctk.CTkCheckBox(scroll,
-                                   text=f"{eid}  {emps[eid]}",
-                                   variable=var)
-            chk.pack(anchor="w", padx=4, pady=2)
+            chk = ctk.CTkCheckBox(scroll, text=f"{eid}  {emps[eid]}",
+                                   variable=var, text_color=_C["ink"])
+            chk.pack(anchor="w", padx=4, pady=3)
             chk_vars[eid] = var
             chk_widgets[eid] = chk
 
@@ -1301,13 +1512,17 @@ class EhrsApp(ctk.CTk):
 
         # 全選 / 清除
         btn_bar = ctk.CTkFrame(top, fg_color="transparent")
-        btn_bar.pack(fill="x", padx=8, pady=(4, 0))
+        btn_bar.pack(fill="x", padx=12, pady=(6, 0))
         ctk.CTkButton(btn_bar, text="全選", width=80,
-                      command=lambda: [v.set(True) for v in chk_vars.values()]
-                      ).pack(side="left", padx=4)
-        ctk.CTkButton(btn_bar, text="清除", width=80, fg_color="gray",
-                      command=lambda: [v.set(False) for v in chk_vars.values()]
-                      ).pack(side="left", padx=4)
+                       fg_color=_C["tab_bg"], text_color=_C["ink"],
+                       hover_color=_C["line"], corner_radius=8,
+                       command=lambda: [v.set(True) for v in chk_vars.values()]
+                       ).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(btn_bar, text="清除", width=80,
+                       fg_color=_C["tab_bg"], text_color=_C["ink"],
+                       hover_color=_C["line"], corner_radius=8,
+                       command=lambda: [v.set(False) for v in chk_vars.values()]
+                       ).pack(side="left")
 
         def apply():
             selected = {eid for eid, v in chk_vars.items() if v.get()}
@@ -1316,20 +1531,28 @@ class EhrsApp(ctk.CTk):
             self._apply_punch_filter()
             top.destroy()
 
-        ctk.CTkButton(top, text="確定", command=apply).pack(
-            fill="x", padx=12, pady=8)
+        ctk.CTkButton(top, text="確定",
+                       fg_color=_C["accent"], hover_color=_C["acc_h"],
+                       corner_radius=9, font=("", 13, "bold"),
+                       command=apply).pack(fill="x", padx=12, pady=10)
 
     # --------------------------------------------------------- suggest tab
     def _build_suggest_tab(self, tab) -> None:
-        bar = ctk.CTkFrame(tab)
+        bar = ctk.CTkFrame(tab, fg_color=_C["white"], corner_radius=8,
+                            border_width=1, border_color=_C["line"])
         bar.pack(fill="x", padx=6, pady=6)
-        ctk.CTkLabel(bar, text="依打卡查詢結果建議最適班別（忘打卡不列入）").pack(
-            side="left", padx=8)
+        ctk.CTkLabel(bar, text="依打卡查詢結果建議最適班別（忘打卡不列入）",
+                      text_color=_C["muted"], font=("", 12)).pack(
+            side="left", padx=12, pady=8)
         self.p_overtime = ctk.CTkCheckBox(bar, text="加班建議",
-                                          command=self._compute_suggestions)
+                                            text_color=_C["ink"],
+                                            command=self._compute_suggestions)
         self.p_overtime.pack(side="left", padx=12)
         ctk.CTkButton(bar, text="重新計算", width=90,
-                      command=self._compute_suggestions).pack(side="left", padx=8)
+                       fg_color=_C["accent"], hover_color=_C["acc_h"],
+                       corner_radius=8,
+                       command=self._compute_suggestions).pack(
+            side="left", padx=8, pady=6)
         self.suggest_scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         self.suggest_scroll.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
@@ -1368,19 +1591,19 @@ class EhrsApp(ctk.CTk):
         if not late_early and not overtime:
             ctk.CTkLabel(self.suggest_scroll,
                          text="沒有需要建議的異常記錄（請先到打卡分頁查詢）",
-                         text_color="gray").pack(pady=24)
+                         text_color=_C["muted"]).pack(pady=24)
             return
 
         if late_early:
             ctk.CTkLabel(self.suggest_scroll, text="遲到 / 早退",
-                         font=("", 13, "bold"), text_color="#555").pack(
+                         font=("", 13, "bold"), text_color=_C["ink"]).pack(
                 anchor="w", padx=6, pady=(4, 0))
             for vals in late_early:
                 self._build_suggest_card(vals, overtime_mode=False)
 
         if overtime:
             ctk.CTkLabel(self.suggest_scroll, text="加班",
-                         font=("", 13, "bold"), text_color="#555").pack(
+                         font=("", 13, "bold"), text_color=_C["ink"]).pack(
                 anchor="w", padx=6, pady=(10, 0))
             for vals in overtime:
                 self._build_suggest_card(vals, overtime_mode=True)
@@ -1404,75 +1627,86 @@ class EhrsApp(ctk.CTk):
             sugg = [s for s in _suggest_shifts(
                 clock_in, clock_out, self.shift_codes, preferred_hours=pref_h, top_n=6)
                 if s[5] > cur_h][:3]
-            hdr_color = "#1A5E3A"
+            hdr_color = "#1E6B42"   # 深綠
             tag_text  = "加班建議"
         else:
             sugg = _suggest_shifts(clock_in, clock_out, self.shift_codes, preferred_hours=cur_h)
-            hdr_color = "#7A3B1E"
+            hdr_color = "#8B4500"   # 深橙棕
             tag_text  = remark
 
-        outer = ctk.CTkFrame(self.suggest_scroll, corner_radius=8)
-        outer.pack(fill="x", pady=4, padx=2)
+        outer = ctk.CTkFrame(self.suggest_scroll, corner_radius=10,
+                              fg_color=_C["white"],
+                              border_width=1, border_color=_C["line"])
+        outer.pack(fill="x", pady=5, padx=2)
 
         # ── 標題列 ──────────────────────────────────────────
-        hdr = ctk.CTkFrame(outer, fg_color=hdr_color, corner_radius=8)
+        hdr = ctk.CTkFrame(outer, fg_color=hdr_color, corner_radius=10)
         hdr.pack(fill="x")
         ctk.CTkLabel(hdr, text=f"{name}  {emp_id}",
-                     font=("", 13, "bold"), text_color="white").pack(
-            side="left", padx=12, pady=6)
-        ctk.CTkLabel(hdr, text=date, text_color="#FFDDCC").pack(side="left", padx=4)
+                      font=("", 13, "bold"), text_color="#FFFFFF").pack(
+            side="left", padx=14, pady=8)
+        ctk.CTkLabel(hdr, text=date,
+                      text_color="#FFDDC0", font=("", 12)).pack(side="left", padx=4)
         ctk.CTkLabel(hdr, text=tag_text,
-                     text_color="#FFD700", font=("", 12, "bold")).pack(
-            side="right", padx=12)
+                      text_color="#FFE680", font=("", 12, "bold")).pack(
+            side="right", padx=14)
 
         # ── 應排班 vs 實際打卡 ────────────────────────────────
         info = ctk.CTkFrame(outer, fg_color="transparent")
-        info.pack(fill="x", padx=8, pady=(6, 2))
+        info.pack(fill="x", padx=10, pady=(8, 4))
 
-        cur_f = ctk.CTkFrame(info, fg_color="#FFF3EC", corner_radius=6)
+        cur_f = ctk.CTkFrame(info, fg_color="#FFF4EE", corner_radius=8,
+                              border_width=1, border_color="#FDDDC9")
         cur_f.pack(side="left", fill="both", expand=True, padx=(0, 4))
         ctk.CTkLabel(cur_f, text="應排班",
-                     text_color="gray", font=("", 11)).pack(anchor="w", padx=8, pady=(6, 0))
+                      text_color=_C["muted"], font=("", 11)).pack(
+            anchor="w", padx=10, pady=(8, 0))
         ctk.CTkLabel(cur_f, text=shift_code or "—",
-                     text_color="#CC3300", font=("", 15, "bold")).pack(anchor="w", padx=8)
+                      text_color=_C["accent"], font=("", 15, "bold")).pack(
+            anchor="w", padx=10)
         code_name = self.shift_codes.get(shift_code, ("", 3))[0] if shift_code else ""
         ctk.CTkLabel(cur_f, text=code_name or f"{sched_in}–{sched_out}",
-                     font=("", 11)).pack(anchor="w", padx=8)
+                      font=("", 11), text_color=_C["ink"]).pack(anchor="w", padx=10)
         if shift_code or (sched_in and sched_out):
-            disp_h = _shift_hours(shift_code) or (_calc_hours(sched_in, sched_out) if sched_in and sched_out else 0.0)
+            disp_h = _shift_hours(shift_code) or (
+                _calc_hours(sched_in, sched_out) if sched_in and sched_out else 0.0)
             if disp_h:
                 ctk.CTkLabel(cur_f, text=f"{disp_h:g}h",
-                             text_color="gray").pack(anchor="w", padx=8, pady=(0, 6))
+                              text_color=_C["muted"]).pack(
+                    anchor="w", padx=10, pady=(0, 8))
 
-        act_f = ctk.CTkFrame(info, fg_color="#F0F0FF", corner_radius=6)
+        act_f = ctk.CTkFrame(info, fg_color="#EEF4FF", corner_radius=8,
+                              border_width=1, border_color="#CCDDFF")
         act_f.pack(side="left", fill="both", expand=True, padx=(4, 0))
         ctk.CTkLabel(act_f, text="實際打卡",
-                     text_color="gray", font=("", 11)).pack(anchor="w", padx=8, pady=(6, 0))
+                      text_color=_C["muted"], font=("", 11)).pack(
+            anchor="w", padx=10, pady=(8, 0))
         punch_txt = (f"{clock_in}  →  {clock_out}"
                      if clock_in and clock_out else clock_in or clock_out or "—")
         ctk.CTkLabel(act_f, text=punch_txt,
-                     font=("", 14, "bold"), text_color="#333399").pack(
-            anchor="w", padx=8, pady=(4, 6))
+                      font=("", 14, "bold"), text_color=_C["ink"]).pack(
+            anchor="w", padx=10, pady=(4, 8))
 
         # ── 建議班別 ─────────────────────────────────────────
         if not sugg:
             ctk.CTkLabel(outer, text="找不到合適的班別建議",
-                         text_color="gray").pack(pady=6)
+                          text_color=_C["muted"]).pack(pady=8)
         for i, (code, si, so, d_in, d_out, h) in enumerate(sugg):
-            row_bg = "#F9F9F9" if i % 2 == 0 else "#FFFFFF"
-            row = ctk.CTkFrame(outer, fg_color=row_bg, corner_radius=4)
-            row.pack(fill="x", padx=8, pady=1)
+            row_bg = _C["row_alt"] if i % 2 == 0 else _C["white"]
+            row = ctk.CTkFrame(outer, fg_color=row_bg, corner_radius=6)
+            row.pack(fill="x", padx=8, pady=2)
 
             rank_txt = "★" if i == 0 else str(i + 1)
             ctk.CTkLabel(row, text=rank_txt, width=24,
-                         text_color="#FF9900" if i == 0 else "#888888",
-                         font=("", 13, "bold")).pack(side="left", padx=4, pady=4)
+                          text_color="#D08000" if i == 0 else _C["muted"],
+                          font=("", 13, "bold")).pack(side="left", padx=6, pady=5)
 
             s_name = self.shift_codes.get(code, ("", 3))[0]
             ctk.CTkLabel(row, text=f"{code}  {s_name or f'{si}–{so}'}",
-                         width=210, anchor="w").pack(side="left", padx=4)
+                          width=210, anchor="w",
+                          text_color=_C["ink"]).pack(side="left", padx=4)
             ctk.CTkLabel(row, text=f"{h:g}h",
-                         width=36, text_color="gray").pack(side="left")
+                          width=36, text_color=_C["muted"]).pack(side="left")
 
             parts: list[str] = []
             if d_in > 0:
@@ -1482,12 +1716,14 @@ class EhrsApp(ctk.CTk):
             elif d_out < 0:
                 parts.append(f"早退{-d_out}分")
             ctk.CTkLabel(row, text="·".join(parts),
-                         text_color="#FF6600", width=110).pack(side="left", padx=4)
+                          text_color="#D07000", width=110).pack(side="left", padx=4)
 
             ctk.CTkButton(
                 row, text="套用", width=60, height=28,
+                fg_color=_C["accent"], hover_color=_C["acc_h"],
+                corner_radius=6, font=("", 12),
                 command=lambda eid=emp_id, dt=date, c=code: self._apply_suggestion(eid, dt, c)
-            ).pack(side="right", padx=8, pady=4)
+            ).pack(side="right", padx=8, pady=5)
 
     def _apply_suggestion(self, emp_id: str, date_str: str, code: str) -> None:
         if not self._need_client():
