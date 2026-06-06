@@ -49,6 +49,23 @@ _C = {
 _WEEK = "一二三四五六日"
 
 
+def _get_schedule_periods(roc_year: int) -> list[tuple[dt.date, dt.date]]:
+    """計算指定民國年度的 14 個四週排班期間（每期 28 天）。
+    民國 115 年基準起始日：2025-12-22（週一）。
+    相鄰年度以 ±52 週（364 天）近似推算，維持週一起始。
+    回傳 [(start, end), ...] × 14。
+    """
+    _ANCHOR_ROC  = 115
+    _ANCHOR_DATE = dt.date(2025, 12, 22)
+    diff   = roc_year - _ANCHOR_ROC
+    anchor = _ANCHOR_DATE + dt.timedelta(weeks=52 * diff)
+    return [
+        (anchor + dt.timedelta(days=28 * i),
+         anchor + dt.timedelta(days=28 * i + 27))
+        for i in range(14)
+    ]
+
+
 def _is_rest(code: str) -> bool:
     """排休班別判斷：991 及 991-x 開頭的都算排休。"""
     return bool(code) and code.startswith("991")
@@ -389,23 +406,47 @@ class EhrsApp(ctk.CTk):
         bar = ctk.CTkFrame(tab, fg_color=_C["white"], corner_radius=8,
                             border_width=1, border_color=_C["line"])
         bar.pack(fill="x", padx=6, pady=6)
+
         now = dt.date.today()
-        self.year_var = ctk.StringVar(value=str(now.year))
+        self.year_var  = ctk.StringVar(value=str(now.year))
         self.month_var = ctk.StringVar(value=str(now.month))
+        self._period_start: dt.date | None = None
+        self._period_end:   dt.date | None = None
+        self._grid_dates:   list[dt.date]  = []
+
+        # ── 民國年 ──────────────────────────────────────────
+        ctk.CTkLabel(bar, text="民國", text_color=_C["ink"],
+                      font=("", 13)).pack(side="left", padx=(12, 2), pady=6)
+        self.roc_year_var = ctk.StringVar(value=str(now.year - 1911))
+        roc_ent = ctk.CTkEntry(bar, textvariable=self.roc_year_var, width=54,
+                                border_color=_C["line"], fg_color=_C["white"],
+                                text_color=_C["ink"])
+        roc_ent.pack(side="left", pady=6)
         ctk.CTkLabel(bar, text="年", text_color=_C["ink"],
-                      font=("", 13)).pack(side="left", padx=(12, 2))
-        ctk.CTkEntry(bar, textvariable=self.year_var, width=70,
-                      border_color=_C["line"], fg_color=_C["white"],
-                      text_color=_C["ink"]).pack(side="left")
-        ctk.CTkLabel(bar, text="月", text_color=_C["ink"],
-                      font=("", 13)).pack(side="left", padx=(10, 2))
-        ctk.CTkEntry(bar, textvariable=self.month_var, width=50,
-                      border_color=_C["line"], fg_color=_C["white"],
-                      text_color=_C["ink"]).pack(side="left")
-        ctk.CTkButton(bar, text="載入排班",
-                       fg_color=_C["accent"], hover_color=_C["acc_h"],
-                       corner_radius=8, font=("", 13, "bold"),
-                       command=self._load_schedule).pack(side="left", padx=12, pady=6)
+                      font=("", 13)).pack(side="left", padx=(2, 8))
+
+        # ── 排班期間下拉 ─────────────────────────────────────
+        self.period_var  = ctk.StringVar()
+        self.period_menu = ctk.CTkOptionMenu(
+            bar, variable=self.period_var, width=200,
+            fg_color=_C["white"], button_color=_C["accent"],
+            button_hover_color=_C["acc_h"],
+            dropdown_fg_color=_C["white"],
+            dropdown_hover_color=_C["tab_bg"],
+            text_color=_C["ink"], dropdown_text_color=_C["ink"],
+            command=self._on_period_select,
+        )
+        self.period_menu.pack(side="left", pady=6)
+        roc_ent.bind("<Return>",   lambda e: self._refresh_period_menu())
+        roc_ent.bind("<FocusOut>", lambda e: self._refresh_period_menu())
+
+        # ── 操作按鈕 ─────────────────────────────────────────
+        ctk.CTkButton(
+            bar, text="載入排班",
+            fg_color=_C["accent"], hover_color=_C["acc_h"],
+            corner_radius=8, font=("", 13, "bold"),
+            command=self._load_schedule,
+        ).pack(side="left", padx=10, pady=6)
         ctk.CTkLabel(bar, text="雙擊格子可改班 / 刪班",
                       text_color=_C["muted"], font=("", 12)).pack(side="left", padx=4)
         ctk.CTkButton(bar, text="匯出 Excel", width=100,
@@ -417,11 +458,12 @@ class EhrsApp(ctk.CTk):
                        corner_radius=8, command=self._import_schedule
                        ).pack(side="right", padx=(4, 0), pady=6)
 
+        # ── 排班格 ───────────────────────────────────────────
         wrap = tk.Frame(tab, bg=_C["app_bg"])
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.grid_tv = ttk.Treeview(wrap, style="App.Treeview",
                                      show="headings", height=18)
-        ysb = ttk.Scrollbar(wrap, orient="vertical", command=self.grid_tv.yview)
+        ysb = ttk.Scrollbar(wrap, orient="vertical",   command=self.grid_tv.yview)
         xsb = ttk.Scrollbar(wrap, orient="horizontal", command=self.grid_tv.xview)
         self.grid_tv.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
         self.grid_tv.grid(row=0, column=0, sticky="nsew")
@@ -430,6 +472,55 @@ class EhrsApp(ctk.CTk):
         wrap.rowconfigure(0, weight=1)
         wrap.columnconfigure(0, weight=1)
         self.grid_tv.bind("<Double-1>", self._on_grid_double)
+
+        # 初始化期間選單
+        self._refresh_period_menu()
+
+    # ── 排班期間選單輔助 ───────────────────────────────────────────────────────
+    def _refresh_period_menu(self) -> None:
+        """依目前民國年重建排班期間選單，並自動定位到當前期間。"""
+        try:
+            roc_year = int(self.roc_year_var.get().strip())
+        except ValueError:
+            return
+        self.year_var.set(str(roc_year + 1911))
+        periods = _get_schedule_periods(roc_year)
+        labels  = self._period_labels(periods)
+        self.period_menu.configure(values=labels)
+        # 自動選中包含今天的期間（否則選最後一期）
+        today   = dt.date.today()
+        sel_idx = len(periods) - 1
+        for i, (s, e) in enumerate(periods):
+            if s <= today <= e:
+                sel_idx = i
+                break
+        self.period_var.set(labels[sel_idx])
+        self._on_period_select(labels[sel_idx])
+
+    def _on_period_select(self, choice: str) -> None:
+        """期間下拉變更：更新內部 _period_start / _period_end。"""
+        try:
+            roc_year = int(self.roc_year_var.get().strip())
+        except ValueError:
+            return
+        periods = _get_schedule_periods(roc_year)
+        labels  = self._period_labels(periods)
+        try:
+            idx = labels.index(choice)
+        except ValueError:
+            return
+        s, e = periods[idx]
+        self._period_start = s
+        self._period_end   = e
+        self.year_var.set(str(s.year))
+        self.month_var.set(str(s.month))
+
+    @staticmethod
+    def _period_labels(periods: list) -> list[str]:
+        return [
+            f"第 {i+1:>2} 期　{s.month}/{s.day} ～ {e.month}/{e.day}"
+            for i, (s, e) in enumerate(periods)
+        ]
 
     def _build_punch_tab(self, tab) -> None:
         _btn_outline = dict(fg_color=_C["white"], text_color=_C["ink"],
@@ -872,24 +963,67 @@ class EhrsApp(ctk.CTk):
     def _load_schedule(self) -> None:
         if not self._need_client():
             return
-        try:
-            year = int(self.year_var.get())
-            month = int(self.month_var.get())
-        except ValueError:
-            messagebox.showwarning("輸入錯誤", "年/月請填數字。")
-            return
-        self._set_status(f"載入 {year}-{month:02d} 排班中…")
 
-        def work():
-            return self.client.get_schedule(year, month)
+        if self._period_start and self._period_end:
+            # ── 四週期間模式 ─────────────────────────────────────
+            start, end = self._period_start, self._period_end
+            period_lbl = f"{start.month}/{start.day}～{end.month}/{end.day}"
+            dates = [start + dt.timedelta(days=i)
+                     for i in range((end - start).days + 1)]
 
-        def done(sched):
-            self.schedule = sched
-            self._build_code_map(sched)
-            self._populate_grid(year, month, sched)
-            self._set_status(f"已載入 {year}-{month:02d} 排班(共 {len(sched)} 人)")
+            # 收集期間橫跨的所有年月
+            months_needed: set[tuple[int, int]] = set()
+            cur = start.replace(day=1)
+            while cur <= end:
+                months_needed.add((cur.year, cur.month))
+                cur = (cur.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
 
-        self._run_async(work, done)
+            self._set_status(f"載入 {period_lbl} 排班中…")
+
+            def work_p():
+                emp_map: dict[str, object] = {}
+                for yr, mn in sorted(months_needed):
+                    try:
+                        for emp in self.client.get_schedule(yr, mn):
+                            if emp.emp_id not in emp_map:
+                                emp_map[emp.emp_id] = emp
+                            else:
+                                existing = {s.date for s in emp_map[emp.emp_id].shifts}
+                                for s in emp.shifts:
+                                    if s.date not in existing:
+                                        emp_map[emp.emp_id].shifts.append(s)
+                    except Exception:
+                        pass
+                return list(emp_map.values()), dates
+
+            def done_p(result):
+                sched, dates = result
+                self.schedule = sched
+                self._build_code_map(sched)
+                self._populate_grid_period(dates, sched)
+                self._set_status(f"已載入 {period_lbl} 排班（共 {len(sched)} 人）")
+
+            self._run_async(work_p, done_p)
+        else:
+            # ── 單月備用模式 ─────────────────────────────────────
+            try:
+                year  = int(self.year_var.get())
+                month = int(self.month_var.get())
+            except ValueError:
+                messagebox.showwarning("輸入錯誤", "年/月請填數字。")
+                return
+            self._set_status(f"載入 {year}-{month:02d} 排班中…")
+
+            def work():
+                return self.client.get_schedule(year, month)
+
+            def done(sched):
+                self.schedule = sched
+                self._build_code_map(sched)
+                self._populate_grid(year, month, sched)
+                self._set_status(f"已載入 {year}-{month:02d} 排班（共 {len(sched)} 人）")
+
+            self._run_async(work, done)
 
     def _build_code_map(self, sched) -> None:
         for emp in sched:
@@ -903,6 +1037,8 @@ class EhrsApp(ctk.CTk):
                     )
 
     def _populate_grid(self, year: int, month: int, sched) -> None:
+        """單月排班格（備用，import 結束後呼叫）。"""
+        self._grid_dates = []   # 清除期間模式
         ndays = _cal.monthrange(year, month)[1]
         cols = ["emp"] + [f"d{d}" for d in range(1, ndays + 1)]
         tv = self.grid_tv
@@ -923,6 +1059,28 @@ class EhrsApp(ctk.CTk):
             iid = tv.insert("", "end", values=values)
             self.row_emp[iid] = emp
 
+    def _populate_grid_period(self, dates: list[dt.date], sched) -> None:
+        """四週期間排班格：以連續日期清單建立 28 欄。"""
+        self._grid_dates = list(dates)
+        cols = ["emp"] + [f"dd{i}" for i in range(len(dates))]
+        tv = self.grid_tv
+        tv.delete(*tv.get_children())
+        tv["columns"] = cols
+        tv.heading("emp", text="員工")
+        tv.column("emp", width=150, anchor="w", stretch=False)
+        for i, d in enumerate(dates):
+            wd = _WEEK[d.weekday()]
+            tv.heading(f"dd{i}", text=f"{d.month}/{d.day}\n{wd}")
+            tv.column(f"dd{i}", width=52, anchor="center", stretch=False)
+        self.row_emp = {}
+        for emp in sched:
+            by_date = {s.date: s.code for s in emp.shifts}
+            values  = [f"{emp.emp_id} {emp.name}"] + [
+                by_date.get(d.isoformat(), "") for d in dates
+            ]
+            iid = tv.insert("", "end", values=values)
+            self.row_emp[iid] = emp
+
     def _on_grid_double(self, event) -> None:
         tv = self.grid_tv
         if tv.identify("region", event.x, event.y) != "cell":
@@ -931,16 +1089,26 @@ class EhrsApp(ctk.CTk):
         row = tv.identify_row(event.y)
         if not row or col in ("", "#1"):
             return
-        day = int(col[1:]) - 1
         emp = self.row_emp.get(row)
-        if emp is None or day < 1:
+        if emp is None:
             return
-        self._open_editor(emp, day)
+        col_idx = int(col[1:]) - 2   # "#2" → 0, "#3" → 1, ...
+        if col_idx < 0:
+            return
+        if self._grid_dates:
+            # ── 四週期間模式 ─────────────────────────────
+            if col_idx >= len(self._grid_dates):
+                return
+            date_str = self._grid_dates[col_idx].isoformat()
+        else:
+            # ── 單月備用模式 ─────────────────────────────
+            day = col_idx + 1
+            year  = int(self.year_var.get())
+            month = int(self.month_var.get())
+            date_str = f"{year:04d}-{month:02d}-{day:02d}"
+        self._open_editor(emp, date_str)
 
-    def _open_editor(self, emp, day: int) -> None:
-        year = int(self.year_var.get())
-        month = int(self.month_var.get())
-        date_str = f"{year:04d}-{month:02d}-{day:02d}"
+    def _open_editor(self, emp, date_str: str) -> None:
         cur = emp.shift_on(date_str)
 
         top = ctk.CTkToplevel(self)
@@ -1098,37 +1266,49 @@ class EhrsApp(ctk.CTk):
         if not self.schedule:
             messagebox.showwarning("尚未載入", "請先載入排班。")
             return
-        year, month = int(self.year_var.get()), int(self.month_var.get())
-        ndays = _cal.monthrange(year, month)[1]
+        # 決定要匯出的日期清單
+        if self._grid_dates:
+            dates_obj = self._grid_dates
+            s, e = dates_obj[0], dates_obj[-1]
+            default_name = f"排班_{s.year}-{s.month:02d}{s.day:02d}_{e.month:02d}{e.day:02d}.xlsx"
+            sheet_title  = f"{s.month}/{s.day}～{e.month}/{e.day}"
+        else:
+            year, month = int(self.year_var.get()), int(self.month_var.get())
+            ndays       = _cal.monthrange(year, month)[1]
+            dates_obj   = [dt.date(year, month, d) for d in range(1, ndays + 1)]
+            default_name = f"排班_{year}-{month:02d}.xlsx"
+            sheet_title  = f"{year}-{month:02d}"
+
         path = filedialog.asksaveasfilename(
             defaultextension=".xlsx",
             filetypes=[("Excel 活頁簿", "*.xlsx")],
-            initialfile=f"排班_{year}-{month:02d}.xlsx",
+            initialfile=default_name,
         )
         if not path:
             return
+
+        dates_iso = [d.isoformat() for d in dates_obj]
         wb = openpyxl.Workbook()
         ws = wb.active
-        ws.title = f"{year}-{month:02d}"
-        dates = [f"{year}-{month:02d}-{d:02d}" for d in range(1, ndays + 1)]
-        ws.append(["員工代號", "員工姓名"] + dates)
-        hdr_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+        ws.title = sheet_title
+        ws.append(["員工代號", "員工姓名"] + dates_iso)
+        hdr_fill   = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
         wkend_fill = PatternFill(start_color="FFE0E0", end_color="FFE0E0", fill_type="solid")
         for cell in ws[1]:
-            cell.font = Font(bold=True)
+            cell.font      = Font(bold=True)
             cell.alignment = Alignment(horizontal="center", wrap_text=True)
-            cell.fill = hdr_fill
+            cell.fill      = hdr_fill
         ws.row_dimensions[1].height = 36
-        for d in range(1, ndays + 1):
-            if _cal.weekday(year, month, d) >= 5:
-                ws.cell(1, d + 2).fill = wkend_fill
+        for col_i, d in enumerate(dates_obj, start=3):
+            if d.weekday() >= 5:
+                ws.cell(1, col_i).fill = wkend_fill
         ws.column_dimensions["A"].width = 10
         ws.column_dimensions["B"].width = 10
-        for i in range(3, ndays + 3):
+        for i in range(3, len(dates_obj) + 3):
             ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = 7
         for emp in self.schedule:
             by_day = {s.date: s.code for s in emp.shifts}
-            ws.append([emp.emp_id, emp.name] + [by_day.get(d, "") for d in dates])
+            ws.append([emp.emp_id, emp.name] + [by_day.get(d, "") for d in dates_iso])
         for row in ws.iter_rows(min_row=2):
             for cell in row:
                 cell.alignment = Alignment(horizontal="center")
