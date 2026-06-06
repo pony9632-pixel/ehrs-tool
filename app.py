@@ -219,6 +219,75 @@ def _assign_single_punch(punch: str, sched_in: str, sched_out: str) -> tuple[str
     return ("", punch) if sched_out else (punch, "")
 
 
+class _ScheduleHeader(tk.Canvas):
+    """自訂雙排表頭：上列顯示月/日，下列顯示星期，六日紅字底色。
+    與排班 Treeview 水平捲動同步（由外部呼叫 sync_x）。"""
+    DATE_H  = 22
+    WD_H    = 18
+    TOTAL_H = DATE_H + WD_H   # 40 px
+    EMP_W   = 150
+    COL_W   = 52
+    _BG     = "#EEF2FB"
+    _WKBG   = "#FFF0F0"   # 六日背景
+    _GRID   = "#E8EBF4"
+    _INK    = "#2D3048"
+    _RED    = "#CC2200"   # 六日文字
+
+    def __init__(self, parent, **kw):
+        kw.setdefault("highlightthickness", 0)
+        kw.setdefault("bd", 0)
+        kw.setdefault("bg", self._BG)
+        kw.setdefault("height", self.TOTAL_H)
+        super().__init__(parent, **kw)
+        self._dates: list[dt.date] = []
+
+    def set_dates(self, dates: list[dt.date]) -> None:
+        self._dates = list(dates)
+        self._redraw()
+
+    def sync_x(self, first, *_) -> None:
+        """由 Treeview xscrollcommand 呼叫，同步水平捲動位置。"""
+        self.xview_moveto(first)
+
+    def _redraw(self) -> None:
+        self.delete("all")
+        dates   = self._dates
+        total_w = self.EMP_W + self.COL_W * len(dates)
+        self.configure(scrollregion=(0, 0, total_w, self.TOTAL_H))
+
+        # 員工欄（跨兩排高度，固定不捲動）
+        self.create_rectangle(0, 0, self.EMP_W, self.TOTAL_H,
+                               fill=self._BG, outline=self._GRID)
+        self.create_text(self.EMP_W // 2, self.TOTAL_H // 2,
+                         text="員工",
+                         font=("TkDefaultFont", 12, "bold"),
+                         fill=self._INK, anchor="center")
+
+        for i, d in enumerate(dates):
+            x0 = self.EMP_W + i * self.COL_W
+            x1 = x0 + self.COL_W
+            is_wkend = d.weekday() >= 5   # 5=Sat, 6=Sun
+            bg = self._WKBG if is_wkend else self._BG
+            fg = self._RED  if is_wkend else self._INK
+
+            # 上列：月/日
+            self.create_rectangle(x0, 0, x1, self.DATE_H,
+                                   fill=bg, outline=self._GRID)
+            self.create_text((x0 + x1) // 2, self.DATE_H // 2,
+                             text=f"{d.month}/{d.day}",
+                             font=("TkDefaultFont", 11, "bold"),
+                             fill=fg, anchor="center")
+
+            # 下列：星期
+            self.create_rectangle(x0, self.DATE_H, x1, self.TOTAL_H,
+                                   fill=bg, outline=self._GRID)
+            self.create_text((x0 + x1) // 2,
+                             self.DATE_H + self.WD_H // 2,
+                             text=_WEEK[d.weekday()],
+                             font=("TkDefaultFont", 11),
+                             fill=fg, anchor="center")
+
+
 class _PunchTable(tk.Frame):
     """Canvas-based table 支援單格著色。"""
 
@@ -461,15 +530,25 @@ class EhrsApp(ctk.CTk):
         # ── 排班格 ───────────────────────────────────────────
         wrap = tk.Frame(tab, bg=_C["app_bg"])
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # 自訂雙排表頭（月/日 + 星期，六日紅字）
+        self._sched_header = _ScheduleHeader(wrap)
+        self._sched_header.grid(row=0, column=0, sticky="ew")
+
         self.grid_tv = ttk.Treeview(wrap, style="App.Treeview",
-                                     show="headings", height=18)
+                                     show="", height=18)
         ysb = ttk.Scrollbar(wrap, orient="vertical",   command=self.grid_tv.yview)
         xsb = ttk.Scrollbar(wrap, orient="horizontal", command=self.grid_tv.xview)
-        self.grid_tv.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
-        self.grid_tv.grid(row=0, column=0, sticky="nsew")
-        ysb.grid(row=0, column=1, sticky="ns")
-        xsb.grid(row=1, column=0, sticky="ew")
-        wrap.rowconfigure(0, weight=1)
+
+        def _on_xscroll(first, last):
+            xsb.set(first, last)
+            self._sched_header.sync_x(first)
+
+        self.grid_tv.configure(yscrollcommand=ysb.set, xscrollcommand=_on_xscroll)
+        self.grid_tv.grid(row=1, column=0, sticky="nsew")
+        ysb.grid(row=1, column=1, sticky="ns")
+        xsb.grid(row=2, column=0, sticky="ew")
+        wrap.rowconfigure(1, weight=1)
         wrap.columnconfigure(0, weight=1)
         self.grid_tv.bind("<Double-1>", self._on_grid_double)
 
@@ -1040,16 +1119,15 @@ class EhrsApp(ctk.CTk):
         """單月排班格（備用，import 結束後呼叫）。"""
         self._grid_dates = []   # 清除期間模式
         ndays = _cal.monthrange(year, month)[1]
+        month_dates = [dt.date(year, month, d) for d in range(1, ndays + 1)]
         cols = ["emp"] + [f"d{d}" for d in range(1, ndays + 1)]
         tv = self.grid_tv
         tv.delete(*tv.get_children())
         tv["columns"] = cols
-        tv.heading("emp", text="員工")
         tv.column("emp", width=150, anchor="w", stretch=False)
         for d in range(1, ndays + 1):
-            wd = _WEEK[_cal.weekday(year, month, d)]
-            tv.heading(f"d{d}", text=f"{d}/{wd}")
             tv.column(f"d{d}", width=52, anchor="center", stretch=False)
+        self._sched_header.set_dates(month_dates)
         self.row_emp = {}
         for emp in sched:
             by_day = {int(s.date[8:10]): s.code for s in emp.shifts}
@@ -1066,12 +1144,10 @@ class EhrsApp(ctk.CTk):
         tv = self.grid_tv
         tv.delete(*tv.get_children())
         tv["columns"] = cols
-        tv.heading("emp", text="員工")
         tv.column("emp", width=150, anchor="w", stretch=False)
-        for i, d in enumerate(dates):
-            wd = _WEEK[d.weekday()]
-            tv.heading(f"dd{i}", text=f"{d.month}/{d.day}\n{wd}")
+        for i in range(len(dates)):
             tv.column(f"dd{i}", width=52, anchor="center", stretch=False)
+        self._sched_header.set_dates(dates)
         self.row_emp = {}
         for emp in sched:
             by_date = {s.date: s.code for s in emp.shifts}
