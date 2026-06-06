@@ -810,6 +810,10 @@ class EhrsApp(ctk.CTk):
                        fg_color=_C["muted"], hover_color="#6B7280",
                        corner_radius=8, command=self._export_punch
                        ).pack(side="right", padx=6, pady=6)
+        ctk.CTkButton(bar, text="出勤統計", width=100,
+                       fg_color=_C["accent"], hover_color=_C["acc_h"],
+                       corner_radius=8, command=self._show_attendance_stats
+                       ).pack(side="right", padx=(0, 4), pady=6)
 
         wrap = tk.Frame(tab, bg=_C["app_bg"])
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
@@ -1600,6 +1604,126 @@ class EhrsApp(ctk.CTk):
         wb.save(path)
         self._set_status(f"已匯出 {len(data)} 筆打卡 → {path}")
 
+    # ── 出勤統計 ───────────────────────────────────────────────────────────────
+    def _compute_attendance_stats(self) -> list[tuple]:
+        """從 _punch_cache 算每人出勤摘要。"""
+        _ERR_K = ("遲到", "上班忘打卡", "早退", "下班忘打卡", "曠職")
+        stats: dict[str, dict] = {}
+        for vals, _ in self._punch_cache:
+            emp_id, name, date, code, sched_in, sched_out, clock_in, clock_out, remark = vals
+            if emp_id not in stats:
+                stats[emp_id] = dict(name=name, sched=0, work=0,
+                                     total_h=0.0, ot_h=0.0,
+                                     leave=0, absent=0, late=0, early=0)
+            s = stats[emp_id]
+            remark = remark or ""
+            is_err   = any(k in remark for k in _ERR_K)
+            is_ot    = "加班" in remark
+            is_leave = bool(remark) and not is_err and not is_ot
+            if code and not _is_rest(code):
+                s['sched'] += 1
+            if clock_in:
+                s['work'] += 1
+            if clock_in and clock_out:
+                ci = _punch_mins(clock_in)
+                co = _punch_mins(clock_out)
+                if co < ci: co += 1440
+                h = (co - ci) / 60
+                if h > 9:   h -= 1
+                elif h > 4: h -= 0.5
+                s['total_h'] += max(0, h)
+            if is_ot:
+                m = re.search(r'加班([\d.]+)h', remark)
+                if m: s['ot_h'] += float(m.group(1))
+            if is_leave:         s['leave']  += 1
+            if '曠職' in remark: s['absent'] += 1
+            if '遲到' in remark: s['late']   += 1
+            if '早退' in remark: s['early']  += 1
+        return [
+            (eid, d['name'], d['sched'], d['work'],
+             round(d['total_h'], 1),
+             round(d['ot_h'], 1) if d['ot_h'] else "",
+             d['leave'], d['absent'], d['late'], d['early'])
+            for eid, d in sorted(stats.items())
+        ]
+
+    def _show_attendance_stats(self) -> None:
+        rows = self._compute_attendance_stats()
+        if not rows:
+            messagebox.showinfo("提示", "請先查詢打卡資料。")
+            return
+        start = self.p_start.get().strip()
+        end   = self.p_end.get().strip()
+
+        top = ctk.CTkToplevel(self)
+        top.title(f"出勤統計　{start}～{end}")
+        top.geometry("920x520")
+        top.configure(fg_color=_C["app_bg"])
+        top.transient(self)
+
+        _COLS = [
+            ("員工代號", 80), ("員工姓名", 90), ("應出勤", 60), ("實出勤", 60),
+            ("工時(h)", 65), ("加班(h)", 65), ("請假(天)", 65),
+            ("曠職", 50), ("遲到", 50), ("早退", 50),
+        ]
+        col_ids = [f"c{i}" for i in range(len(_COLS))]
+
+        wrap = tk.Frame(top, bg=_C["app_bg"])
+        wrap.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+
+        tv = ttk.Treeview(wrap, style="App.Treeview",
+                          columns=col_ids, show="headings", height=18)
+        for cid, (hdr, w) in zip(col_ids, _COLS):
+            tv.heading(cid, text=hdr)
+            anc = "w" if hdr in ("員工代號", "員工姓名") else "center"
+            tv.column(cid, width=w, anchor=anc, stretch=False)
+        for row in rows:
+            tv.insert("", "end", values=row)
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=vsb.set)
+        tv.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        def _export():
+            path = filedialog.asksaveasfilename(
+                defaultextension=".xlsx",
+                filetypes=[("Excel 活頁簿", "*.xlsx")],
+                initialfile=f"出勤統計_{start}_{end}.xlsx",
+                parent=top,
+            )
+            if not path:
+                return
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "出勤統計"
+            hdrs = [h for h, _ in _COLS]
+            ws.append(hdrs)
+            hdr_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2",
+                                   fill_type="solid")
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal="center")
+                cell.fill = hdr_fill
+            for row in rows:
+                ws.append(list(row))
+            col_ws = [10, 12, 8, 8, 9, 9, 9, 7, 7, 7]
+            for i, w in enumerate(col_ws, start=1):
+                ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+            for r in ws.iter_rows(min_row=2):
+                for cell in r:
+                    cell.alignment = Alignment(horizontal="center")
+                r[1].alignment = Alignment(horizontal="left")
+            try:
+                wb.save(path)
+                messagebox.showinfo("完成", f"已匯出 {len(rows)} 人統計 → {path}",
+                                    parent=top)
+            except Exception as exc:
+                messagebox.showerror("匯出失敗", str(exc), parent=top)
+
+        ctk.CTkButton(top, text="匯出 Excel", width=120,
+                       fg_color=_C["muted"], hover_color="#6B7280",
+                       corner_radius=8, command=_export).pack(pady=8)
+
     def _import_schedule(self) -> None:
         if not self._need_client():
             return
@@ -2235,6 +2359,7 @@ class EhrsApp(ctk.CTk):
 
         def done(_):
             self._set_status(f"已套用：{emp_id} {date_str} → {code}")
+            self._load_schedule()
 
         self._run_async(work, done)
 
