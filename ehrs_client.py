@@ -468,13 +468,16 @@ class EhrsClient:
         changes: list[dict],
         dry_run: bool = True,
         confirm: bool = True,
+        progress_cb=None,        # Callable[[done: int, total: int], None]
     ) -> list[dict]:
         """批次建立/修改班別,只抓一次班表。
-        changes 每筆需含 emp_id、date、shift_code,可選 kind。"""
+        changes 每筆需含 emp_id、date、shift_code,可選 kind。
+        progress_cb(done, total) 每處理完一筆即呼叫一次。"""
         filt = self._schedule_filter(year, month)
         calendar = self.get_schedule_raw(year, month)
         results: list[dict] = []
-        for ch in changes:
+        total = len(changes)
+        for i, ch in enumerate(changes, 1):
             emp_id = ch["emp_id"]
             date = ch["date"]
             shift_code = ch["shift_code"]
@@ -485,6 +488,8 @@ class EhrsClient:
                 )
             except EhrsError as exc:
                 results.append({"ok": False, "emp_id": emp_id, "date": date, "error": str(exc)})
+                if progress_cb:
+                    progress_cb(i, total)
                 continue
             is_update = payload["wpb29"].get("pb29995") is not None
             path = (
@@ -496,6 +501,8 @@ class EhrsClient:
                     "dry_run": True, "endpoint": path,
                     "emp_id": emp_id, "date": date, "shift_code": shift_code,
                 })
+                if progress_cb:
+                    progress_cb(i, total)
                 continue
             try:
                 result, confirmations = self._post_shift_write(path, payload, confirm=confirm)
@@ -506,6 +513,8 @@ class EhrsClient:
                 })
             except EhrsError as exc:
                 results.append({"ok": False, "emp_id": emp_id, "date": date, "error": str(exc)})
+            if progress_cb:
+                progress_cb(i, total)
         return results
 
     def delete_shift(

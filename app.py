@@ -279,8 +279,20 @@ class EhrsApp(ctk.CTk):
         self._build_suggest_tab(self.tabview.add("建議"))
         self._build_settings_tab(self.tabview.add("設定"))
 
-        self.status = ctk.CTkLabel(self, text="就緒", anchor="w")
-        self.status.pack(side="bottom", fill="x", padx=12, pady=(0, 8))
+        # ── 底部 status bar（含匯入進度條）─────────────────────────
+        btm = ctk.CTkFrame(self, fg_color="transparent")
+        btm.pack(side="bottom", fill="x", padx=12, pady=(0, 8))
+
+        self.status = ctk.CTkLabel(btm, text="就緒", anchor="w")
+        self.status.pack(side="left", fill="x", expand=True)
+
+        # 進度條區塊（平時隱藏，匯入時顯示）
+        self._prog_frm = ctk.CTkFrame(btm, fg_color="transparent")
+        self._prog_bar = ctk.CTkProgressBar(self._prog_frm, width=200, height=14)
+        self._prog_bar.set(0)
+        self._prog_bar.pack(side="left", padx=(0, 6))
+        self._prog_lbl = ctk.CTkLabel(self._prog_frm, text="", width=70, anchor="e")
+        self._prog_lbl.pack(side="left")
 
     def _build_schedule_tab(self, tab) -> None:
         bar = ctk.CTkFrame(tab)
@@ -380,6 +392,20 @@ class EhrsApp(ctk.CTk):
     # -------------------------------------------------------------- helpers
     def _set_status(self, text: str) -> None:
         self.status.configure(text=text)
+
+    def _show_progress(self, done: int, total: int) -> None:
+        """顯示匯入進度條（在主執行緒呼叫）。"""
+        if total == 0:
+            return
+        self._prog_bar.set(done / total)
+        self._prog_lbl.configure(text=f"{done} / {total}")
+        if not self._prog_frm.winfo_ismapped():
+            self._prog_frm.pack(side="right")
+
+    def _hide_progress(self) -> None:
+        """隱藏進度條。"""
+        self._prog_frm.pack_forget()
+        self._prog_bar.set(0)
 
     def _run_async(self, work, on_done, on_error=None) -> None:
         def worker():
@@ -786,16 +812,26 @@ class EhrsApp(ctk.CTk):
             "這會寫入正式班表，確定？",
         ):
             return
-        self._set_status(f"匯入中（{len(changes)} 筆）…")
+        self._set_status(f"匯入中…")
+        self._show_progress(0, len(changes))
 
         def work():
-            # 排班一律 kind=3；只有排休代碼才自動偵測
             for ch in changes:
                 if not _is_rest(ch["shift_code"]):
                     ch.setdefault("kind", 3)
-            return self.client.set_shifts_bulk(year, month, changes, dry_run=False)
+
+            def on_progress(done_n: int, total: int) -> None:
+                self.after(0, lambda d=done_n, t=total: (
+                    self._show_progress(d, t),
+                    self._set_status(f"匯入中  {d} / {t}"),
+                ))
+
+            return self.client.set_shifts_bulk(
+                year, month, changes, dry_run=False, progress_cb=on_progress
+            )
 
         def done(results):
+            self._hide_progress()
             ok_n = sum(1 for r in results if r.get("ok"))
             fail_n = len(results) - ok_n
             self._set_status(f"匯入完成：{ok_n} 筆成功，{fail_n} 筆失敗")
