@@ -14,4 +14,10 @@ python3 updater.py
 # 啟動主程式
 python3 app.py
 
-osascript -e 'tell application "Terminal" to close front window' 2>/dev/null
+# bash 結束後自動關閉終端機視窗，不顯示「有執行中程序」確認對話框
+# 做法：把 AppleScript 放到背景、disown 讓它在 bash 結束後繼續存活，
+#       bash 一 exit 就不再有 shell 程序，Terminal 關窗時不會再詢問。
+( sleep 0.4 && osascript -e 'tell application "Terminal" to close front window' ) \
+    >/dev/null 2>&1 &
+disown $!
+exit 0
