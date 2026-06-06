@@ -1790,8 +1790,10 @@ class EhrsApp(ctk.CTk):
 
         def work():
             for ch in changes:
-                if not _is_rest(ch["shift_code"]):
-                    ch.setdefault("kind", 3)
+                if _is_rest(ch["shift_code"]):
+                    ch.setdefault("kind", 3)   # 排休
+                else:
+                    ch.setdefault("kind", 1)   # 工作日
 
             def on_progress(done_n: int, total: int) -> None:
                 self.after(0, lambda d=done_n, t=total: (
