@@ -73,6 +73,26 @@ def _split_punches(punches: list[str], sched_in: str, sched_out: str) -> tuple[s
     return (in_grp[0] if in_grp else ""), (out_grp[-1] if out_grp else "")
 
 
+def _split_punches_jiezhuan(punches: list[str], sched_in: str, sched_out: str) -> tuple[str, str]:
+    """結轉打卡專用分群：不做 2 小時截斷，直接以距表定時間近遠判斷上/下班。
+    支援跨夜班（凌晨打卡加 1440 修正）。"""
+    if not sched_in or not sched_out:
+        return punches[0], punches[-1]
+    si = _punch_mins(sched_in)
+    so = _punch_mins(sched_out)
+    cross = so < si
+    if cross:
+        so += 1440   # 跨夜班：把下班時間加一天
+    in_grp, out_grp = [], []
+    for p in punches:
+        pm = _punch_mins(p)
+        # 跨夜班：凌晨打卡若距上班超過 6 小時，視為隔天
+        if cross and pm < si - 360:
+            pm += 1440
+        (out_grp if abs(pm - so) <= abs(pm - si) else in_grp).append(p)
+    return (in_grp[0] if in_grp else ""), (out_grp[-1] if out_grp else "")
+
+
 def _punch_remark(clock_in: str, clock_out: str, sched_in: str, sched_out: str) -> str:
     """產生備注文字：遲到、早退、上班忘打卡、下班忘打卡（可複合）。"""
     remarks: list[str] = []
@@ -856,11 +876,22 @@ class EhrsApp(ctk.CTk):
             name = group[0].get("員工姓名", "")
             code, _ = (sched_map or {}).get((emp_id, date), ("", ""))
             sched_in, sched_out = _shift_times(code) if code else ("", "")
-            punches = [str(r.get("刷卡時間", ""))[11:16] for r in group]
-            if len(punches) == 1:
-                clock_in, clock_out = _assign_single_punch(punches[0], sched_in, sched_out)
+            # 提取打卡時間，區分有無結轉標記
+            all_punches = [(str(r.get("刷卡時間", ""))[11:16],
+                            r.get("結轉註記", "")) for r in group]
+            jiezhuan = [t for t, flag in all_punches if flag == "結轉" and t]
+            all_times  = [t for t, _  in all_punches if t]
+            # 有結轉打卡 → 優先使用，用寬鬆分群；否則用全部打卡與原分群邏輯
+            if jiezhuan:
+                use_punches = jiezhuan
+                split_fn = _split_punches_jiezhuan
             else:
-                clock_in, clock_out = _split_punches(punches, sched_in, sched_out)
+                use_punches = all_times
+                split_fn = _split_punches
+            if len(use_punches) == 1:
+                clock_in, clock_out = _assign_single_punch(use_punches[0], sched_in, sched_out)
+            else:
+                clock_in, clock_out = split_fn(use_punches, sched_in, sched_out)
             remark = _punch_remark(clock_in, clock_out, sched_in, sched_out)
             display.append((emp_id, name, date, code, sched_in, sched_out, clock_in, clock_out, remark))
 
