@@ -298,6 +298,121 @@ class _ScheduleHeader(tk.Canvas):
                              fill=fg, anchor="center")
 
 
+class _ScheduleGrid(tk.Frame):
+    """Canvas-based schedule grid；kind=3（排休）顯示紅字。"""
+    ROW_H   = 26
+    EMP_W   = 150
+    HOURS_W = 60
+    COL_W   = 52
+    FONT    = ("TkDefaultFont", 11)
+    BG      = ("#FFFFFF", "#F8F9FD")
+    GRID_C  = "#E8EBF4"
+    INK     = "#2D3048"
+    REST_FG = "#CC2200"   # kind=3 排休紅字
+
+    def __init__(self, parent, on_double=None, **kw):
+        super().__init__(parent, **kw)
+        self._on_double = on_double          # callback(emp_obj, col_idx)
+        self._rows: list = []                # [(emp, values_list, kinds_list)]
+        self._dates: list = []
+
+        self._cv = tk.Canvas(self, bg="#FFFFFF", highlightthickness=0)
+        self._cv.grid(row=0, column=0, sticky="nsew")
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        self._cv.bind("<MouseWheel>",
+                      lambda e: self._cv.yview_scroll(int(-1 * e.delta / 60), "units"))
+        self._cv.bind("<Double-Button-1>", self._handle_double)
+
+    # ── 對外 scroll API（接替 ttk.Treeview） ──────────────────────────────
+    def configure(self, **kw):
+        ys = kw.pop("yscrollcommand", None)
+        xs = kw.pop("xscrollcommand", None)
+        if ys: self._cv.configure(yscrollcommand=ys)
+        if xs: self._cv.configure(xscrollcommand=xs)
+        if kw: super().configure(**kw)
+
+    def yview(self, *a): self._cv.yview(*a)
+    def xview(self, *a): self._cv.xview(*a)
+    def xview_moveto(self, f): self._cv.xview_moveto(f)
+
+    # ── 填充資料 ──────────────────────────────────────────────────────────
+    def populate(self, dates: list, emp_rows: list) -> None:
+        """
+        dates    : list[dt.date]
+        emp_rows : [(emp_obj, values_list, kinds_list)]
+          values_list[0] = 員工標籤, [1] = 時數, [2+] = 班別代號
+          kinds_list[j]  = 第 j 個日期的 pb29004 (int|None)
+        """
+        self._cv.delete("all")
+        self._rows  = emp_rows
+        self._dates = dates
+        total_w = self.EMP_W + self.HOURS_W + self.COL_W * len(dates)
+
+        for i, (emp, vals, kinds) in enumerate(emp_rows):
+            y0 = i * self.ROW_H
+            y1 = y0 + self.ROW_H
+            bg = self.BG[i % 2]
+
+            # 員工欄（靠左文字）
+            x = 0
+            self._cv.create_rectangle(x, y0, x + self.EMP_W, y1,
+                                      fill=bg, outline=self.GRID_C)
+            self._cv.create_text(x + 8, (y0 + y1) // 2, text=vals[0],
+                                 font=self.FONT, fill=self.INK,
+                                 anchor="w", width=self.EMP_W - 12)
+            x += self.EMP_W
+
+            # 時數欄（置中）
+            self._cv.create_rectangle(x, y0, x + self.HOURS_W, y1,
+                                      fill=bg, outline=self.GRID_C)
+            self._cv.create_text(x + self.HOURS_W // 2, (y0 + y1) // 2,
+                                 text=vals[1], font=self.FONT, fill=self.INK,
+                                 anchor="center")
+            x += self.HOURS_W
+
+            # 日期欄
+            for j in range(len(dates)):
+                code = vals[2 + j] if 2 + j < len(vals) else ""
+                kind = kinds[j] if j < len(kinds) else None
+                fg   = self.REST_FG if self._is_rest_cell(kind, code) else self.INK
+                self._cv.create_rectangle(x, y0, x + self.COL_W, y1,
+                                          fill=bg, outline=self.GRID_C)
+                if code:
+                    self._cv.create_text(x + self.COL_W // 2, (y0 + y1) // 2,
+                                         text=code, font=self.FONT, fill=fg,
+                                         anchor="center", width=self.COL_W - 4)
+                x += self.COL_W
+
+        total_h = len(emp_rows) * self.ROW_H
+        self._cv.configure(scrollregion=(0, 0, total_w, total_h))
+
+    @staticmethod
+    def _is_rest_cell(kind, code: str) -> bool:
+        """kind=3 → 排休紅字；kind=None 時以 991* 代碼判斷。"""
+        if kind == 3:
+            return True
+        if kind is None and code and code.startswith("991"):
+            return True
+        return False
+
+    def _handle_double(self, event) -> None:
+        if not self._on_double or not self._rows:
+            return
+        cx = self._cv.canvasx(event.x)
+        cy = self._cv.canvasy(event.y)
+        if cx < self.EMP_W + self.HOURS_W:
+            return   # 點到員工欄或時數欄
+        col_idx = int((cx - self.EMP_W - self.HOURS_W) // self.COL_W)
+        row_idx = int(cy // self.ROW_H)
+        if row_idx < 0 or row_idx >= len(self._rows):
+            return
+        if col_idx < 0 or col_idx >= len(self._dates):
+            return
+        self._on_double(self._rows[row_idx][0], col_idx)
+
+
 class _PunchTable(tk.Frame):
     """Canvas-based table 支援單格著色。"""
 
@@ -376,7 +491,6 @@ class EhrsApp(ctk.CTk):
         self.account: str = ""
         self.cfg = load_config()
         self.schedule: list = []
-        self.row_emp: dict = {}
         self.shift_codes: dict[str, tuple[str, int]] = dict(SHIFT_CODES_REF)
         self._punch_cache: list[tuple] = []
         self._raw_punch_rows: list[dict] = []   # 原始刷卡紀錄（每刷一筆一列）
@@ -545,8 +659,8 @@ class EhrsApp(ctk.CTk):
         self._sched_header = _ScheduleHeader(wrap)
         self._sched_header.grid(row=0, column=0, sticky="ew")
 
-        self.grid_tv = ttk.Treeview(wrap, style="App.Treeview",
-                                     show="", height=18)
+        self.grid_tv = _ScheduleGrid(wrap, on_double=self._on_grid_double_canvas,
+                                      bg=_C["app_bg"])
         ysb = ttk.Scrollbar(wrap, orient="vertical",   command=self.grid_tv.yview)
         xsb = ttk.Scrollbar(wrap, orient="horizontal", command=self.grid_tv.xview)
 
@@ -560,7 +674,6 @@ class EhrsApp(ctk.CTk):
         xsb.grid(row=2, column=0, sticky="ew")
         wrap.rowconfigure(1, weight=1)
         wrap.columnconfigure(0, weight=1)
-        self.grid_tv.bind("<Double-1>", self._on_grid_double)
 
         # 初始化期間選單
         self._refresh_period_menu()
@@ -1127,82 +1240,55 @@ class EhrsApp(ctk.CTk):
 
     def _populate_grid(self, year: int, month: int, sched) -> None:
         """單月排班格（備用，import 結束後呼叫）。"""
-        self._grid_dates = []   # 清除期間模式
+        self._grid_dates = []
         ndays = _cal.monthrange(year, month)[1]
         month_dates = [dt.date(year, month, d) for d in range(1, ndays + 1)]
-        cols = ["emp", "hours"] + [f"d{d}" for d in range(1, ndays + 1)]
-        tv = self.grid_tv
-        tv.delete(*tv.get_children())
-        tv["columns"] = cols
-        tv.column("emp",   width=150, anchor="w",      stretch=False)
-        tv.column("hours", width=60,  anchor="center", stretch=False)
-        for d in range(1, ndays + 1):
-            tv.column(f"d{d}", width=52, anchor="center", stretch=False)
         self._sched_header.set_dates(month_dates)
-        self.row_emp = {}
+        emp_rows = []
         for emp in sched:
-            by_day = {int(s.date[8:10]): s.code for s in emp.shifts}
+            by_day      = {int(s.date[8:10]): s.code for s in emp.shifts}
+            by_day_kind = {int(s.date[8:10]): s.kind for s in emp.shifts}
             total_h = sum(
                 _shift_hours(by_day[d]) for d in range(1, ndays + 1)
                 if d in by_day and by_day[d] and not _is_rest(by_day[d])
             )
-            h_str = f"{total_h:g}" if total_h else ""
+            h_str  = f"{total_h:g}" if total_h else ""
             values = [f"{emp.emp_id} {emp.name}", h_str] + [
                 by_day.get(d, "") for d in range(1, ndays + 1)
             ]
-            iid = tv.insert("", "end", values=values)
-            self.row_emp[iid] = emp
+            kinds  = [by_day_kind.get(d) for d in range(1, ndays + 1)]
+            emp_rows.append((emp, values, kinds))
+        self.grid_tv.populate(month_dates, emp_rows)
 
     def _populate_grid_period(self, dates: list[dt.date], sched) -> None:
         """四週期間排班格：以連續日期清單建立 28 欄。"""
         self._grid_dates = list(dates)
-        cols = ["emp", "hours"] + [f"dd{i}" for i in range(len(dates))]
-        tv = self.grid_tv
-        tv.delete(*tv.get_children())
-        tv["columns"] = cols
-        tv.column("emp",   width=150, anchor="w",      stretch=False)
-        tv.column("hours", width=60,  anchor="center", stretch=False)
-        for i in range(len(dates)):
-            tv.column(f"dd{i}", width=52, anchor="center", stretch=False)
         self._sched_header.set_dates(dates)
-        self.row_emp = {}
+        emp_rows = []
         for emp in sched:
-            by_date = {s.date: s.code for s in emp.shifts}
+            by_date      = {s.date: s.code for s in emp.shifts}
+            by_date_kind = {s.date: s.kind for s in emp.shifts}
             total_h = sum(
                 _shift_hours(by_date[d.isoformat()]) for d in dates
                 if d.isoformat() in by_date
                 and by_date[d.isoformat()]
                 and not _is_rest(by_date[d.isoformat()])
             )
-            h_str = f"{total_h:g}" if total_h else ""
+            h_str  = f"{total_h:g}" if total_h else ""
             values = [f"{emp.emp_id} {emp.name}", h_str] + [
                 by_date.get(d.isoformat(), "") for d in dates
             ]
-            iid = tv.insert("", "end", values=values)
-            self.row_emp[iid] = emp
+            kinds  = [by_date_kind.get(d.isoformat()) for d in dates]
+            emp_rows.append((emp, values, kinds))
+        self.grid_tv.populate(dates, emp_rows)
 
-    def _on_grid_double(self, event) -> None:
-        tv = self.grid_tv
-        if tv.identify("region", event.x, event.y) != "cell":
-            return
-        col = tv.identify_column(event.x)
-        row = tv.identify_row(event.y)
-        if not row or col in ("", "#1", "#2"):   # skip emp & hours
-            return
-        emp = self.row_emp.get(row)
-        if emp is None:
-            return
-        col_idx = int(col[1:]) - 3   # "#3" → 0, "#4" → 1, ...
-        if col_idx < 0:
-            return
+    def _on_grid_double_canvas(self, emp, col_idx: int) -> None:
         if self._grid_dates:
-            # ── 四週期間模式 ─────────────────────────────
             if col_idx >= len(self._grid_dates):
                 return
             date_str = self._grid_dates[col_idx].isoformat()
         else:
-            # ── 單月備用模式 ─────────────────────────────
-            day = col_idx + 1
+            day   = col_idx + 1
             year  = int(self.year_var.get())
             month = int(self.month_var.get())
             date_str = f"{year:04d}-{month:02d}-{day:02d}"
