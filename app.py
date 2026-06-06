@@ -1352,7 +1352,7 @@ class EhrsApp(ctk.CTk):
         ctk.CTkLabel(kind_bar, text="排班日種類：",
                       text_color=_C["ink"], font=("", 12)
                       ).pack(side="left", padx=(10, 6), pady=6)
-        for _lbl, _val in [("工作日 (1)", 1), ("休息日 (2)", 2), ("排休 (3)", 3)]:
+        for _lbl, _val in [("工作日 (1)", 1), ("排休 (3)", 3)]:
             ctk.CTkRadioButton(kind_bar, text=_lbl, variable=kind_var, value=_val,
                                 text_color=_C["ink"], font=("", 12)
                                 ).pack(side="left", padx=8, pady=6)
@@ -1439,7 +1439,7 @@ class EhrsApp(ctk.CTk):
     def _apply_set(self, emp, date_str: str, code: str, kind: int = 1) -> None:
         year, month, _ = (int(x) for x in date_str.split("-"))
         self._set_status("寫入中…")
-        # kind 由 UI 選擇器傳入（工作日=1 / 休息日=2 / 排休=3）
+        # kind 由 UI 選擇器傳入（工作日=1 / 排休=3）
 
         def work():
             return self.client.set_shift(
@@ -2101,7 +2101,7 @@ class EhrsApp(ctk.CTk):
         ctk.CTkLabel(kind_bar, text="排班日種類：",
                       text_color=_C["ink"], font=("", 11)
                       ).pack(side="left", padx=(10, 6), pady=5)
-        for _lbl, _val in [("工作日 (1)", 1), ("休息日 (2)", 2), ("排休 (3)", 3)]:
+        for _lbl, _val in [("工作日 (1)", 1), ("排休 (3)", 3)]:
             ctk.CTkRadioButton(kind_bar, text=_lbl, variable=kind_var, value=_val,
                                 text_color=_C["ink"], font=("", 11)
                                 ).pack(side="left", padx=8, pady=5)
