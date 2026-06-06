@@ -522,22 +522,38 @@ class EhrsClient:
         dry_run: bool = True,
         confirm: bool = True,
         progress_cb=None,        # Callable[[done: int, total: int], None]
-        max_workers: int = 8,
+        max_workers: int = 6,
     ) -> list[dict]:
-        """批次建立/修改班別,只抓一次班表,並行送出請求。
+        """批次建立/修改班別,並行送出請求。
         changes 每筆需含 emp_id、date、shift_code,可選 kind。
+        自動依 date 分組,跨月期間(如 6/8～7/5)各月分別抓 calendar。
         progress_cb(done, total) 每處理完一筆即呼叫一次。
-        max_workers 控制並行 HTTP 連線數,預設 8。"""
-        filt = self._schedule_filter(year, month)
-        calendar = self.get_schedule_raw(year, month)
+        max_workers 控制並行 HTTP 連線數,預設 6。"""
+        # 依各筆資料的實際年月分組,跨月自動處理
+        from collections import defaultdict
+        groups: dict[tuple[int, int], list[tuple[int, dict]]] = defaultdict(list)
+        for idx, ch in enumerate(changes):
+            y, m = int(ch["date"][:4]), int(ch["date"][5:7])
+            groups[(y, m)].append((idx, ch))
+
+        # 每個涉及月份各抓一次 calendar（sequential，避免重複請求）
+        cal_map: dict[tuple[int, int], tuple[dict, dict]] = {}
+        for (y, m) in groups:
+            cal_map[(y, m)] = (
+                self._schedule_filter(y, m),
+                self.get_schedule_raw(y, m),
+            )
+
         total = len(changes)
         results: list[dict | None] = [None] * total
         done_count = [0]
         lock = threading.Lock()
 
         def _process(idx: int, ch: dict) -> None:
-            emp_id = ch["emp_id"]
-            date   = ch["date"]
+            y, m = int(ch["date"][:4]), int(ch["date"][5:7])
+            filt, calendar = cal_map[(y, m)]
+            emp_id     = ch["emp_id"]
+            date       = ch["date"]
             shift_code = ch["shift_code"]
             kind = ch.get("kind") or self._kind_from_calendar(calendar, shift_code)
             try:
