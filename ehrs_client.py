@@ -369,23 +369,32 @@ class EhrsClient:
              if _as_date(c["calendarDate"]) == target),
             None,
         )
-        if cell is None:
-            raise EhrsError(f"班表中找不到日期 {target.isoformat()}")
-
-        existing = (cell.get("schedules") or [None])[0]
         date_iso = f"{target.isoformat()}T00:00:00"
-        wpb29 = dict(existing) if existing else {}
-        wpb29.update(
-            {
+        if cell is None:
+            # 該月尚未在 eHRS 開啟過/無格子，直接建立最小 wpb29（走 Create）
+            wpb29 = {
                 "pb29002": date_iso,
                 "pb29003": emp_id,
                 "pb29004": kind,
                 "pb29005": shift_code,
+                "pb29001": emp.get("pb29001") or emp.get("pa51001") or "",
+                "pb29006": "",
+                "pb29010": 0,
             }
-        )
-        wpb29.setdefault("pb29001", existing.get("pb29001") if existing else "")
-        wpb29.setdefault("pb29006", "")
-        wpb29.setdefault("pb29010", 0)
+        else:
+            existing = (cell.get("schedules") or [None])[0]
+            wpb29 = dict(existing) if existing else {}
+            wpb29.update(
+                {
+                    "pb29002": date_iso,
+                    "pb29003": emp_id,
+                    "pb29004": kind,
+                    "pb29005": shift_code,
+                }
+            )
+            wpb29.setdefault("pb29001", existing.get("pb29001") if existing else "")
+            wpb29.setdefault("pb29006", "")
+            wpb29.setdefault("pb29010", 0)
 
         data = {
             "isCheckOverTime": False,
