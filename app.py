@@ -226,6 +226,7 @@ class _ScheduleHeader(tk.Canvas):
     WD_H    = 18
     TOTAL_H = DATE_H + WD_H   # 40 px
     EMP_W   = 150
+    HOURS_W = 60    # 總時數欄
     COL_W   = 52
     _BG     = "#EEF2FB"
     _WKBG   = "#FFF0F0"   # 六日背景
@@ -252,10 +253,10 @@ class _ScheduleHeader(tk.Canvas):
     def _redraw(self) -> None:
         self.delete("all")
         dates   = self._dates
-        total_w = self.EMP_W + self.COL_W * len(dates)
+        total_w = self.EMP_W + self.HOURS_W + self.COL_W * len(dates)
         self.configure(scrollregion=(0, 0, total_w, self.TOTAL_H))
 
-        # 員工欄（跨兩排高度，固定不捲動）
+        # 員工欄（跨兩排高度）
         self.create_rectangle(0, 0, self.EMP_W, self.TOTAL_H,
                                fill=self._BG, outline=self._GRID)
         self.create_text(self.EMP_W // 2, self.TOTAL_H // 2,
@@ -263,8 +264,17 @@ class _ScheduleHeader(tk.Canvas):
                          font=("TkDefaultFont", 12, "bold"),
                          fill=self._INK, anchor="center")
 
+        # 時數欄（跨兩排高度）
+        hx = self.EMP_W
+        self.create_rectangle(hx, 0, hx + self.HOURS_W, self.TOTAL_H,
+                               fill=self._BG, outline=self._GRID)
+        self.create_text(hx + self.HOURS_W // 2, self.TOTAL_H // 2,
+                         text="時數",
+                         font=("TkDefaultFont", 12, "bold"),
+                         fill=self._INK, anchor="center")
+
         for i, d in enumerate(dates):
-            x0 = self.EMP_W + i * self.COL_W
+            x0 = self.EMP_W + self.HOURS_W + i * self.COL_W
             x1 = x0 + self.COL_W
             is_wkend = d.weekday() >= 5   # 5=Sat, 6=Sun
             bg = self._WKBG if is_wkend else self._BG
@@ -1120,18 +1130,24 @@ class EhrsApp(ctk.CTk):
         self._grid_dates = []   # 清除期間模式
         ndays = _cal.monthrange(year, month)[1]
         month_dates = [dt.date(year, month, d) for d in range(1, ndays + 1)]
-        cols = ["emp"] + [f"d{d}" for d in range(1, ndays + 1)]
+        cols = ["emp", "hours"] + [f"d{d}" for d in range(1, ndays + 1)]
         tv = self.grid_tv
         tv.delete(*tv.get_children())
         tv["columns"] = cols
-        tv.column("emp", width=150, anchor="w", stretch=False)
+        tv.column("emp",   width=150, anchor="w",      stretch=False)
+        tv.column("hours", width=60,  anchor="center", stretch=False)
         for d in range(1, ndays + 1):
             tv.column(f"d{d}", width=52, anchor="center", stretch=False)
         self._sched_header.set_dates(month_dates)
         self.row_emp = {}
         for emp in sched:
             by_day = {int(s.date[8:10]): s.code for s in emp.shifts}
-            values = [f"{emp.emp_id} {emp.name}"] + [
+            total_h = sum(
+                _shift_hours(by_day[d]) for d in range(1, ndays + 1)
+                if d in by_day and by_day[d] and not _is_rest(by_day[d])
+            )
+            h_str = f"{total_h:g}" if total_h else ""
+            values = [f"{emp.emp_id} {emp.name}", h_str] + [
                 by_day.get(d, "") for d in range(1, ndays + 1)
             ]
             iid = tv.insert("", "end", values=values)
@@ -1140,18 +1156,26 @@ class EhrsApp(ctk.CTk):
     def _populate_grid_period(self, dates: list[dt.date], sched) -> None:
         """四週期間排班格：以連續日期清單建立 28 欄。"""
         self._grid_dates = list(dates)
-        cols = ["emp"] + [f"dd{i}" for i in range(len(dates))]
+        cols = ["emp", "hours"] + [f"dd{i}" for i in range(len(dates))]
         tv = self.grid_tv
         tv.delete(*tv.get_children())
         tv["columns"] = cols
-        tv.column("emp", width=150, anchor="w", stretch=False)
+        tv.column("emp",   width=150, anchor="w",      stretch=False)
+        tv.column("hours", width=60,  anchor="center", stretch=False)
         for i in range(len(dates)):
             tv.column(f"dd{i}", width=52, anchor="center", stretch=False)
         self._sched_header.set_dates(dates)
         self.row_emp = {}
         for emp in sched:
             by_date = {s.date: s.code for s in emp.shifts}
-            values  = [f"{emp.emp_id} {emp.name}"] + [
+            total_h = sum(
+                _shift_hours(by_date[d.isoformat()]) for d in dates
+                if d.isoformat() in by_date
+                and by_date[d.isoformat()]
+                and not _is_rest(by_date[d.isoformat()])
+            )
+            h_str = f"{total_h:g}" if total_h else ""
+            values = [f"{emp.emp_id} {emp.name}", h_str] + [
                 by_date.get(d.isoformat(), "") for d in dates
             ]
             iid = tv.insert("", "end", values=values)
@@ -1163,12 +1187,12 @@ class EhrsApp(ctk.CTk):
             return
         col = tv.identify_column(event.x)
         row = tv.identify_row(event.y)
-        if not row or col in ("", "#1"):
+        if not row or col in ("", "#1", "#2"):   # skip emp & hours
             return
         emp = self.row_emp.get(row)
         if emp is None:
             return
-        col_idx = int(col[1:]) - 2   # "#2" → 0, "#3" → 1, ...
+        col_idx = int(col[1:]) - 3   # "#3" → 0, "#4" → 1, ...
         if col_idx < 0:
             return
         if self._grid_dates:
@@ -1367,7 +1391,7 @@ class EhrsApp(ctk.CTk):
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = sheet_title
-        ws.append(["員工代號", "員工姓名"] + dates_iso)
+        ws.append(["員工代號", "員工姓名", "總時數"] + dates_iso)
         hdr_fill   = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
         wkend_fill = PatternFill(start_color="FFE0E0", end_color="FFE0E0", fill_type="solid")
         for cell in ws[1]:
@@ -1375,16 +1399,22 @@ class EhrsApp(ctk.CTk):
             cell.alignment = Alignment(horizontal="center", wrap_text=True)
             cell.fill      = hdr_fill
         ws.row_dimensions[1].height = 36
-        for col_i, d in enumerate(dates_obj, start=3):
+        for col_i, d in enumerate(dates_obj, start=4):   # 日期欄從第 4 欄開始
             if d.weekday() >= 5:
                 ws.cell(1, col_i).fill = wkend_fill
         ws.column_dimensions["A"].width = 10
         ws.column_dimensions["B"].width = 10
-        for i in range(3, len(dates_obj) + 3):
+        ws.column_dimensions["C"].width = 8    # 總時數
+        for i in range(4, len(dates_obj) + 4):
             ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = 7
         for emp in self.schedule:
             by_day = {s.date: s.code for s in emp.shifts}
-            ws.append([emp.emp_id, emp.name] + [by_day.get(d, "") for d in dates_iso])
+            total_h = sum(
+                _shift_hours(by_day[d]) for d in dates_iso
+                if d in by_day and by_day[d] and not _is_rest(by_day[d])
+            )
+            h_str = f"{total_h:g}" if total_h else ""
+            ws.append([emp.emp_id, emp.name, h_str] + [by_day.get(d, "") for d in dates_iso])
         for row in ws.iter_rows(min_row=2):
             for cell in row:
                 cell.alignment = Alignment(horizontal="center")
