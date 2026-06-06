@@ -133,9 +133,29 @@ def _split_punches_jiezhuan(punches: list[str], sched_in: str, sched_out: str) -
     return (in_grp[0] if in_grp else ""), (out_grp[-1] if out_grp else "")
 
 
-def _punch_remark(clock_in: str, clock_out: str, sched_in: str, sched_out: str) -> str:
-    """產生備注文字：遲到、早退、上班忘打卡、下班忘打卡（可複合）。"""
+def _punch_remark(clock_in: str, clock_out: str, sched_in: str, sched_out: str,
+                  kind: int | None = None) -> str:
+    """產生備注文字：遲到、早退、上班忘打卡、下班忘打卡、加班（可複合）。
+    kind=2 休息日：有打卡即算「休息日加班 Xh」，不另做遲到/早退判斷。
+    """
     remarks: list[str] = []
+
+    # ── 休息日（kind=2）：只要有打卡就是加班 ──────────────────────
+    if kind == 2:
+        if clock_in and clock_out and sched_in and sched_out:
+            ci = _punch_mins(clock_in)
+            co = _punch_mins(clock_out)
+            si = _punch_mins(sched_in)
+            if co < ci: co += 1440   # 跨夜
+            worked_min = co - ci
+            if worked_min > 0:
+                h = round(worked_min / 60 * 2) / 2   # 四捨五入至 0.5h
+                remarks.append(f"休息日加班{h:g}h")
+        elif clock_in:
+            remarks.append("休息日加班")
+        return " ".join(remarks)
+
+    # ── 一般工作日 ─────────────────────────────────────────────────
     if not clock_in:
         remarks.append("上班忘打卡")
     elif sched_in and _punch_mins(clock_in) > _punch_mins(sched_in):
@@ -152,6 +172,9 @@ def _punch_remark(clock_in: str, clock_out: str, sched_in: str, sched_out: str) 
             co += 1440
         if co < so:
             remarks.append("早退")
+        elif co > so + 30:                           # 超過 30 分鐘算加班
+            extra_h = round((co - so) / 60 * 2) / 2
+            remarks.append(f"加班{extra_h:g}h")
     return " ".join(remarks)
 
 
@@ -1691,7 +1714,7 @@ class EhrsApp(ctk.CTk):
                     for es in self.client.get_schedule(cur.year, cur.month):
                         emp_names[es.emp_id] = es.name
                         for s in es.shifts:
-                            sched_map[(es.emp_id, s.date)] = (s.code, s.name)
+                            sched_map[(es.emp_id, s.date)] = (s.code, s.name, s.kind)
                 except Exception:
                     pass
                 cur = (cur.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
@@ -1737,7 +1760,8 @@ class EhrsApp(ctk.CTk):
             punched.add((emp_id, date))
             group = list(grp)
             name = group[0].get("員工姓名", "")
-            code, _ = (sched_map or {}).get((emp_id, date), ("", ""))
+            _sm = (sched_map or {}).get((emp_id, date), ("", "", None))
+            code, _, s_kind = (_sm + (None,))[:3]
             sched_in, sched_out = _shift_times(code) if code else ("", "")
             # 提取打卡時間，區分有無結轉標記
             all_punches = [(str(r.get("刷卡時間", ""))[11:16],
@@ -1755,7 +1779,7 @@ class EhrsApp(ctk.CTk):
                 clock_in, clock_out = _assign_single_punch(use_punches[0], sched_in, sched_out)
             else:
                 clock_in, clock_out = split_fn(use_punches, sched_in, sched_out)
-            remark = _punch_remark(clock_in, clock_out, sched_in, sched_out)
+            remark = _punch_remark(clock_in, clock_out, sched_in, sched_out, kind=s_kind)
             display.append((emp_id, name, date, code, sched_in, sched_out, clock_in, clock_out, remark))
 
         # 1b. 建立 leave_map：(emp_id, date) → 假別名稱（特休/病假/事假…）
@@ -1775,7 +1799,8 @@ class EhrsApp(ctk.CTk):
         if sched_map and range_start and range_end:
             start_d = dt.date.fromisoformat(range_start)
             end_d   = dt.date.fromisoformat(range_end)
-            for (emp_id, date), (code, _) in sched_map.items():
+            for (emp_id, date), sched_val in sched_map.items():
+                code = sched_val[0]
                 if not code or _is_rest(code):
                     continue
                 d = dt.date.fromisoformat(date)
@@ -1785,16 +1810,19 @@ class EhrsApp(ctk.CTk):
                     remark = leave_map.get((emp_id, date), "曠職")
                     display.append((emp_id, name, date, code, sched_in, sched_out, "", "", remark))
 
-        RED   = "#CC0000"
-        GREEN = "#2A8B5A"
-        _ERR  = ("遲到", "上班忘打卡", "早退", "下班忘打卡", "曠職")
+        RED    = "#CC0000"
+        GREEN  = "#2A8B5A"
+        ORANGE = "#C07000"
+        _ERR   = ("遲到", "上班忘打卡", "早退", "下班忘打卡", "曠職")
+        _OT    = ("加班",)   # 含「加班」「休息日加班」
         def _fgs(row: tuple) -> tuple:
             remark = row[8]
             is_err   = remark and any(k in remark for k in _ERR)
-            is_leave = remark and not is_err
+            is_ot    = remark and not is_err and any(k in remark for k in _OT)
+            is_leave = remark and not is_err and not is_ot
             ci_red = RED if remark and any(k in remark for k in ("遲到", "上班忘打卡", "曠職")) else ""
             co_red = RED if remark and any(k in remark for k in ("早退", "下班忘打卡", "曠職")) else ""
-            rm_col = RED if is_err else (GREEN if is_leave else "")
+            rm_col = RED if is_err else (ORANGE if is_ot else (GREEN if is_leave else ""))
             return ("", "", "", "", "", "", ci_red, co_red, rm_col)
 
         self._punch_cache = [
