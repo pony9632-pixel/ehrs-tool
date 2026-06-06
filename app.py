@@ -779,10 +779,18 @@ class EhrsApp(ctk.CTk):
             bar, text="員工：全員 ▼", width=130, **_btn_outline,
             command=self._open_emp_picker
         )
-        self.p_abnormal = ctk.CTkCheckBox(bar, text="只顯示異常",
-                                            text_color=_C["ink"],
-                                            command=self._apply_punch_filter)
-        self.p_abnormal.select()
+        self.p_show_err   = ctk.CTkCheckBox(bar, text="異常",
+                                             text_color=_C["ink"], fg_color=_C["red"],
+                                             command=self._apply_punch_filter)
+        self.p_show_ot    = ctk.CTkCheckBox(bar, text="加班",
+                                             text_color=_C["ink"], fg_color="#C07000",
+                                             command=self._apply_punch_filter)
+        self.p_show_leave = ctk.CTkCheckBox(bar, text="請假",
+                                             text_color=_C["ink"], fg_color=_C["green"],
+                                             command=self._apply_punch_filter)
+        self.p_show_err.select()
+        self.p_show_ot.select()
+        self.p_show_leave.select()
         ctk.CTkLabel(bar, text="起", text_color=_C["ink"],
                       font=("", 13)).pack(side="left", padx=(12, 2))
         self.p_start.pack(side="left", pady=6)
@@ -791,7 +799,9 @@ class EhrsApp(ctk.CTk):
         self.p_end.pack(side="left", pady=6)
         self.p_dept_btn.pack(side="left", padx=(10, 0), pady=6)
         self.p_emp_btn.pack(side="left", padx=(6, 0), pady=6)
-        self.p_abnormal.pack(side="left", padx=10)
+        self.p_show_err.pack(side="left", padx=(10, 4))
+        self.p_show_ot.pack(side="left", padx=4)
+        self.p_show_leave.pack(side="left", padx=(4, 6))
         ctk.CTkButton(bar, text="查詢打卡",
                        fg_color=_C["accent"], hover_color=_C["acc_h"],
                        corner_radius=8, font=("", 13, "bold"),
@@ -1832,13 +1842,27 @@ class EhrsApp(ctk.CTk):
         self._apply_punch_filter()
 
     def _apply_punch_filter(self) -> None:
-        only_abnormal = self.p_abnormal.get()
+        show_err   = self.p_show_err.get()
+        show_ot    = self.p_show_ot.get()
+        show_leave = self.p_show_leave.get()
+        any_filter = show_err or show_ot or show_leave
+        _ERR_K = ("遲到", "上班忘打卡", "早退", "下班忘打卡", "曠職")
+
+        def _cat_match(vals) -> bool:
+            if not any_filter:
+                return True
+            remark = vals[8] or ""
+            is_err   = any(k in remark for k in _ERR_K)
+            is_ot    = "加班" in remark
+            is_leave = bool(remark) and not is_err and not is_ot
+            return (show_err and is_err) or (show_ot and is_ot) or (show_leave and is_leave)
+
         filtered = [
             (vals, fgs) for vals, fgs in self._punch_cache
             if (not self._selected_depts or
                 self._emp_dept.get(vals[0], "") in self._selected_depts)
             and (not self._selected_emps or vals[0] in self._selected_emps)
-            and (not only_abnormal or any(fgs))
+            and _cat_match(vals)
         ]
         self.punch_tbl.populate(filtered)
         self.after(50, self._compute_suggestions)
