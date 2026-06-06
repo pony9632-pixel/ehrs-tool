@@ -1762,12 +1762,15 @@ class EhrsApp(ctk.CTk):
             return
         first_date = next(iter(date_cols.values()))
         year, month = int(first_date[:4]), int(first_date[5:7])
-        # 收集有班別的格子，同一 emp+date 取最後一筆
+        # 收集有班別的格子，同一 emp+date 取最後一筆；同時記錄員工姓名（第 2 欄）
         seen: dict[tuple, dict] = {}
+        emp_names: dict[str, str] = {}
         for row in rows[1:]:
             if not row or not row[0]:
                 continue
             emp_id = str(row[0]).strip()
+            if len(row) > 1 and row[1]:
+                emp_names[emp_id] = str(row[1]).strip()
             for col_idx, date_str in date_cols.items():
                 raw = row[col_idx] if col_idx < len(row) else None
                 code = str(raw).strip() if raw is not None else ""
@@ -1779,9 +1782,22 @@ class EhrsApp(ctk.CTk):
         if not changes:
             messagebox.showinfo("無班別", "沒有找到任何班別資料。")
             return
+
+        # 選擇要匯入的員工（測試用，預設全選）
+        emps = {ch["emp_id"]: emp_names.get(ch["emp_id"], "")
+                for ch in changes}
+        chosen = self._pick_import_employees(emps)
+        if chosen is None:           # 使用者關閉/取消
+            return
+        if not chosen:
+            messagebox.showinfo("未選員工", "沒有勾選任何員工，已取消匯入。")
+            return
+        changes = [ch for ch in changes if ch["emp_id"] in chosen]
+
         if not messagebox.askyesno(
             "確認匯入",
-            f"將匯入 {year}-{month:02d} 排班，共 {len(changes)} 筆。\n\n"
+            f"將匯入 {year}-{month:02d} 排班，共 {len(changes)} 筆"
+            f"（{len(chosen)} 位員工）。\n\n"
             "這會寫入正式班表，確定？",
         ):
             return
@@ -1823,6 +1839,79 @@ class EhrsApp(ctk.CTk):
             self._load_schedule()
 
         self._run_async(work, done)
+
+    def _pick_import_employees(self, emps: dict[str, str]) -> set[str] | None:
+        """匯入前選擇要寫入的員工（測試用）。
+        預設全選；回傳勾選的 emp_id 集合，使用者關閉視窗回傳 None。"""
+        top = ctk.CTkToplevel(self)
+        top.title("選擇要匯入的員工")
+        top.geometry("300x520")
+        top.configure(fg_color=_C["app_bg"])
+        top.resizable(False, True)
+        top.transient(self)
+        top.after(60, top.grab_set)
+
+        result: dict = {"value": None}
+
+        ctk.CTkLabel(top, text="只匯入勾選的員工（測試用，預設全選）",
+                      text_color=_C["muted"], font=("", 12)).pack(
+            padx=12, pady=(12, 4))
+
+        search_var = ctk.StringVar()
+        ctk.CTkEntry(top, placeholder_text="搜尋員工…",
+                      textvariable=search_var,
+                      border_color=_C["line"], fg_color=_C["white"],
+                      text_color=_C["ink"]).pack(fill="x", padx=12, pady=(0, 4))
+
+        scroll = ctk.CTkScrollableFrame(top, fg_color=_C["white"],
+                                          corner_radius=8, border_width=1,
+                                          border_color=_C["line"])
+        scroll.pack(fill="both", expand=True, padx=12, pady=(4, 0))
+
+        chk_vars: dict[str, tk.BooleanVar] = {}
+        chk_widgets: dict[str, ctk.CTkCheckBox] = {}
+        for eid in sorted(emps):
+            var = tk.BooleanVar(value=True)
+            label = f"{eid}  {emps[eid]}".rstrip()
+            chk = ctk.CTkCheckBox(scroll, text=label,
+                                   variable=var, text_color=_C["ink"])
+            chk.pack(anchor="w", padx=4, pady=3)
+            chk_vars[eid] = var
+            chk_widgets[eid] = chk
+
+        def _filter(*_):
+            q = search_var.get().lower()
+            for eid, w in chk_widgets.items():
+                if not q or q in eid.lower() or q in emps[eid].lower():
+                    w.pack(anchor="w", padx=4, pady=2)
+                else:
+                    w.pack_forget()
+        search_var.trace_add("write", _filter)
+
+        btn_bar = ctk.CTkFrame(top, fg_color="transparent")
+        btn_bar.pack(fill="x", padx=12, pady=(6, 0))
+        ctk.CTkButton(btn_bar, text="全選", width=80,
+                       fg_color=_C["tab_bg"], text_color=_C["ink"],
+                       hover_color=_C["line"], corner_radius=8,
+                       command=lambda: [v.set(True) for v in chk_vars.values()]
+                       ).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(btn_bar, text="清除", width=80,
+                       fg_color=_C["tab_bg"], text_color=_C["ink"],
+                       hover_color=_C["line"], corner_radius=8,
+                       command=lambda: [v.set(False) for v in chk_vars.values()]
+                       ).pack(side="left")
+
+        def apply():
+            result["value"] = {eid for eid, v in chk_vars.items() if v.get()}
+            top.destroy()
+
+        ctk.CTkButton(top, text="確定匯入",
+                       fg_color=_C["accent"], hover_color=_C["acc_h"],
+                       corner_radius=9, font=("", 13, "bold"),
+                       command=apply).pack(fill="x", padx=12, pady=10)
+
+        top.wait_window()
+        return result["value"]
 
     # ---------------------------------------------------------------- punch
     def _query_punch(self) -> None:
