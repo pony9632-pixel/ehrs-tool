@@ -265,6 +265,7 @@ class EhrsApp(ctk.CTk):
         self.row_emp: dict = {}
         self.shift_codes: dict[str, tuple[str, int]] = dict(SHIFT_CODES_REF)
         self._punch_cache: list[tuple] = []
+        self._raw_punch_rows: list[dict] = []   # 原始刷卡紀錄（每刷一筆一列）
 
         self._build_ui()
         if auto_login:
@@ -276,6 +277,7 @@ class EhrsApp(ctk.CTk):
         self.tabview.pack(fill="both", expand=True, padx=10, pady=(10, 4))
         self._build_schedule_tab(self.tabview.add("排班"))
         self._build_punch_tab(self.tabview.add("打卡"))
+        self._build_raw_punch_tab(self.tabview.add("打卡紀錄"))
         self._build_suggest_tab(self.tabview.add("建議"))
         self._build_settings_tab(self.tabview.add("設定"))
 
@@ -369,6 +371,216 @@ class EhrsApp(ctk.CTk):
         self.punch_tbl.grid(row=0, column=0, sticky="nsew")
         wrap.rowconfigure(0, weight=1)
         wrap.columnconfigure(0, weight=1)
+
+    def _build_raw_punch_tab(self, tab) -> None:
+        bar = ctk.CTkFrame(tab)
+        bar.pack(fill="x", padx=6, pady=6)
+
+        self._raw_selected_depts: set[str] = set()
+        self._raw_selected_emps:  set[str] = set()
+
+        self.raw_dept_btn = ctk.CTkButton(
+            bar, text="部門：全部 ▼", width=130, fg_color="#5B7FA6",
+            command=self._open_raw_dept_picker
+        )
+        self.raw_emp_btn = ctk.CTkButton(
+            bar, text="員工：全員 ▼", width=130, fg_color="#5B7FA6",
+            command=self._open_raw_emp_picker
+        )
+        self.raw_count_lbl = ctk.CTkLabel(bar, text="共 0 筆", text_color="gray")
+
+        self.raw_dept_btn.pack(side="left", padx=(8, 0))
+        self.raw_emp_btn.pack(side="left", padx=(6, 0))
+        self.raw_count_lbl.pack(side="left", padx=10)
+        ctk.CTkButton(
+            bar, text="匯出 Excel", width=100, command=self._export_raw_punch
+        ).pack(side="right", padx=4)
+
+        wrap = tk.Frame(tab)
+        wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        cols = ("dept", "emp_id", "emp_name", "date", "time", "jiezhuan", "source")
+        self.raw_tv = ttk.Treeview(wrap, columns=cols, show="headings", height=20)
+        for col, lbl, w in [
+            ("dept",      "部門",   90),
+            ("emp_id",    "員工代號", 80),
+            ("emp_name",  "員工姓名", 80),
+            ("date",      "出勤日期", 110),
+            ("time",      "刷卡時間", 90),
+            ("jiezhuan",  "結轉",    60),
+            ("source",    "來源",    70),
+        ]:
+            self.raw_tv.heading(col, text=lbl)
+            self.raw_tv.column(col, width=w, anchor="center", stretch=False)
+        ysb = ttk.Scrollbar(wrap, orient="vertical",   command=self.raw_tv.yview)
+        xsb = ttk.Scrollbar(wrap, orient="horizontal", command=self.raw_tv.xview)
+        self.raw_tv.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self.raw_tv.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew")
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+
+    def _populate_raw_punch(self) -> None:
+        rows = self._raw_punch_rows
+        # 套用篩選
+        def _match(r: dict) -> bool:
+            eid  = r.get("員工代號", "")
+            dept = r.get("部門名稱") or r.get("pa51014FullName", "")
+            if self._raw_selected_depts and dept not in self._raw_selected_depts:
+                return False
+            if self._raw_selected_emps and eid not in self._raw_selected_emps:
+                return False
+            return True
+
+        filtered = [r for r in rows if _match(r)]
+        self.raw_tv.delete(*self.raw_tv.get_children())
+        for r in filtered:
+            dept   = r.get("部門名稱") or r.get("pa51014FullName", "")
+            eid    = r.get("員工代號", "")
+            ename  = r.get("員工姓名", "")
+            date   = str(r.get("出勤日期", ""))[:10]
+            time_  = str(r.get("刷卡時間", ""))[11:16]
+            jz     = r.get("結轉註記", "")
+            src    = r.get("來源", "")
+            self.raw_tv.insert("", "end", values=(dept, eid, ename, date, time_, jz, src))
+        self.raw_count_lbl.configure(text=f"共 {len(filtered)} 筆")
+
+    # ── 打卡紀錄篩選器 ────────────────────────────────────────
+    def _open_raw_dept_picker(self) -> None:
+        depts = sorted({
+            r.get("部門名稱") or r.get("pa51014FullName", "")
+            for r in self._raw_punch_rows
+        } - {""})
+        if not depts:
+            messagebox.showinfo("提示", "請先在打卡分頁查詢資料。")
+            return
+        self._generic_picker(
+            title="選擇部門", items=depts,
+            selected=self._raw_selected_depts,
+            on_confirm=lambda s: (
+                setattr(self, "_raw_selected_depts", s),
+                self.raw_dept_btn.configure(
+                    text="部門：全部 ▼" if not s else f"部門：已選 {len(s)} ▼"
+                ),
+                self._populate_raw_punch(),
+            )
+        )
+
+    def _open_raw_emp_picker(self) -> None:
+        emps: dict[str, str] = {}
+        for r in self._raw_punch_rows:
+            eid = r.get("員工代號", "")
+            name = r.get("員工姓名", "")
+            # 只顯示符合部門篩選的員工
+            dept = r.get("部門名稱") or r.get("pa51014FullName", "")
+            if self._raw_selected_depts and dept not in self._raw_selected_depts:
+                continue
+            if eid:
+                emps[eid] = name
+        if not emps:
+            messagebox.showinfo("提示", "請先在打卡分頁查詢資料。")
+            return
+        self._generic_picker(
+            title="選擇員工",
+            items=[f"{eid}  {name}" for eid, name in sorted(emps.items())],
+            selected={f"{eid}  {emps[eid]}" for eid in self._raw_selected_emps if eid in emps},
+            on_confirm=lambda s: (
+                setattr(self, "_raw_selected_emps",
+                        {item.split()[0] for item in s}),
+                self.raw_emp_btn.configure(
+                    text="員工：全員 ▼" if not s else f"員工：已選 {len(s)} 人 ▼"
+                ),
+                self._populate_raw_punch(),
+            ),
+            searchable=True,
+        )
+
+    def _generic_picker(
+        self, title: str, items: list[str], selected: set[str],
+        on_confirm, searchable: bool = False
+    ) -> None:
+        """通用多選清單彈窗。"""
+        top = ctk.CTkToplevel(self)
+        top.title(title)
+        top.geometry("260x440")
+        top.resizable(False, True)
+        top.transient(self)
+        top.after(60, top.grab_set)
+
+        search_var = ctk.StringVar()
+        if searchable:
+            ctk.CTkEntry(top, placeholder_text="搜尋…",
+                         textvariable=search_var).pack(fill="x", padx=12, pady=(12, 4))
+
+        scroll = ctk.CTkScrollableFrame(top, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=8, pady=(8 if not searchable else 0, 0))
+
+        chk_vars: dict[str, tk.BooleanVar] = {}
+        chk_widgets: dict[str, ctk.CTkCheckBox] = {}
+        for item in items:
+            init = (not selected) or (item in selected)
+            var = tk.BooleanVar(value=init)
+            chk = ctk.CTkCheckBox(scroll, text=item, variable=var)
+            chk.pack(anchor="w", padx=4, pady=2)
+            chk_vars[item] = var
+            chk_widgets[item] = chk
+
+        if searchable:
+            def _filter(*_):
+                q = search_var.get().lower()
+                for it, w in chk_widgets.items():
+                    if not q or q in it.lower():
+                        w.pack(anchor="w", padx=4, pady=2)
+                    else:
+                        w.pack_forget()
+            search_var.trace_add("write", _filter)
+
+        btn_bar = ctk.CTkFrame(top, fg_color="transparent")
+        btn_bar.pack(fill="x", padx=8, pady=(4, 0))
+        ctk.CTkButton(btn_bar, text="全選", width=80,
+                      command=lambda: [v.set(True)  for v in chk_vars.values()]
+                      ).pack(side="left", padx=4)
+        ctk.CTkButton(btn_bar, text="清除", width=80, fg_color="gray",
+                      command=lambda: [v.set(False) for v in chk_vars.values()]
+                      ).pack(side="left", padx=4)
+
+        def apply():
+            picked = {it for it, v in chk_vars.items() if v.get()}
+            final  = set() if len(picked) == len(items) else picked
+            on_confirm(final)
+            top.destroy()
+
+        ctk.CTkButton(top, text="確定", command=apply).pack(
+            fill="x", padx=12, pady=8)
+
+    def _export_raw_punch(self) -> None:
+        rows = list(self.raw_tv.get_children())
+        if not rows:
+            messagebox.showwarning("無資料", "沒有打卡紀錄可匯出。")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel 活頁簿", "*.xlsx")],
+            initialfile="打卡紀錄.xlsx",
+        )
+        if not path:
+            return
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "打卡紀錄"
+        headers = ["部門", "員工代號", "員工姓名", "出勤日期", "刷卡時間", "結轉", "來源"]
+        ws.append(headers)
+        hdr_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center")
+            cell.fill = hdr_fill
+        for iid in rows:
+            ws.append(list(self.raw_tv.item(iid)["values"]))
+        for i, w in enumerate([12, 10, 10, 14, 10, 8, 8], start=1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+        wb.save(path)
+        self._set_status(f"已匯出打卡紀錄 → {path}")
 
     def _build_settings_tab(self, tab) -> None:
         frm = ctk.CTkFrame(tab)
@@ -886,7 +1098,9 @@ class EhrsApp(ctk.CTk):
 
         def done(result):
             punch_rows, sched_map, emp_names, s, e = result
+            self._raw_punch_rows = list(punch_rows)
             self._populate_punch(punch_rows, sched_map, emp_names, s, e)
+            self._populate_raw_punch()
             self._set_status(f"打卡 {start}~{end} 共 {len(punch_rows)} 筆")
 
         self._run_async(work, done)
