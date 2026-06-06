@@ -336,18 +336,18 @@ class EhrsApp(ctk.CTk):
         self.p_start.insert(0, today.replace(day=1).isoformat())
         self.p_end = ctk.CTkEntry(bar, width=110)
         self.p_end.insert(0, today.isoformat())
-        self.p_emp = ctk.CTkEntry(bar, width=90, placeholder_text="員工代號")
-        self.p_all = ctk.CTkCheckBox(bar, text="全員")
-        self.p_all.select()
+        self._selected_emps: set[str] = set()   # empty = 全員
+        self.p_emp_btn = ctk.CTkButton(
+            bar, text="員工：全員 ▼", width=130, fg_color="#5B7FA6",
+            command=self._open_emp_picker
+        )
         self.p_abnormal = ctk.CTkCheckBox(bar, text="只顯示異常", command=self._apply_punch_filter)
         self.p_abnormal.select()
         ctk.CTkLabel(bar, text="起").pack(side="left", padx=(8, 2))
         self.p_start.pack(side="left")
         ctk.CTkLabel(bar, text="迄").pack(side="left", padx=(10, 2))
         self.p_end.pack(side="left")
-        ctk.CTkLabel(bar, text="員工").pack(side="left", padx=(10, 2))
-        self.p_emp.pack(side="left")
-        self.p_all.pack(side="left", padx=10)
+        self.p_emp_btn.pack(side="left", padx=(10, 0))
         self.p_abnormal.pack(side="left", padx=10)
         ctk.CTkButton(bar, text="查詢打卡", command=self._query_punch).pack(
             side="left", padx=12
@@ -855,12 +855,11 @@ class EhrsApp(ctk.CTk):
             return
         start = self.p_start.get().strip()
         end = self.p_end.get().strip()
-        emp = None if self.p_all.get() else (self.p_emp.get().strip() or self.account)
         self._set_status("查詢打卡中…")
 
         def work():
             punch_rows = self.client.get_punch_records(
-                start, end, emp_start=emp, emp_end=emp, readable=True
+                start, end, readable=True
             )
             sched_map: dict[tuple, tuple] = {}
             emp_names: dict[str, str] = {}
@@ -881,8 +880,7 @@ class EhrsApp(ctk.CTk):
         def done(result):
             punch_rows, sched_map, emp_names, s, e = result
             self._populate_punch(punch_rows, sched_map, emp_names, s, e)
-            scope = "全員" if self.p_all.get() else (emp or "")
-            self._set_status(f"打卡 {start}~{end}({scope}) 共 {len(punch_rows)} 筆")
+            self._set_status(f"打卡 {start}~{end} 共 {len(punch_rows)} 筆")
 
         self._run_async(work, done)
 
@@ -960,11 +958,86 @@ class EhrsApp(ctk.CTk):
         only_abnormal = self.p_abnormal.get()
         filtered = [
             (vals, fgs) for vals, fgs in self._punch_cache
-            if not only_abnormal or any(fgs)
+            if (not self._selected_emps or vals[0] in self._selected_emps)
+            and (not only_abnormal or any(fgs))
         ]
         self.punch_tbl.populate(filtered)
         self.after(50, self._compute_suggestions)
 
+    def _update_emp_btn(self) -> None:
+        n = len(self._selected_emps)
+        self.p_emp_btn.configure(
+            text="員工：全員 ▼" if n == 0 else f"員工：已選 {n} 人 ▼"
+        )
+
+    def _open_emp_picker(self) -> None:
+        # 從打卡快取收集所有員工
+        emps: dict[str, str] = {}
+        for vals, _ in self._punch_cache:
+            emps[vals[0]] = vals[1]
+
+        if not emps:
+            messagebox.showinfo("提示", "請先查詢打卡資料。")
+            return
+
+        top = ctk.CTkToplevel(self)
+        top.title("選擇員工")
+        top.geometry("260x480")
+        top.resizable(False, True)
+        top.transient(self)
+        top.after(60, top.grab_set)
+
+        # 搜尋框
+        search_var = ctk.StringVar()
+        ctk.CTkEntry(top, placeholder_text="搜尋員工…",
+                     textvariable=search_var).pack(fill="x", padx=12, pady=(12, 4))
+
+        # 捲動式 checkbox 清單
+        scroll = ctk.CTkScrollableFrame(top, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=8, pady=0)
+
+        chk_vars: dict[str, tk.BooleanVar] = {}
+        chk_widgets: dict[str, ctk.CTkCheckBox] = {}
+        for eid in sorted(emps):
+            init = (not self._selected_emps) or (eid in self._selected_emps)
+            var = tk.BooleanVar(value=init)
+            chk = ctk.CTkCheckBox(scroll,
+                                   text=f"{eid}  {emps[eid]}",
+                                   variable=var)
+            chk.pack(anchor="w", padx=4, pady=2)
+            chk_vars[eid] = var
+            chk_widgets[eid] = chk
+
+        def _filter(*_):
+            q = search_var.get().lower()
+            for eid, w in chk_widgets.items():
+                show = not q or q in eid.lower() or q in emps[eid].lower()
+                if show:
+                    w.pack(anchor="w", padx=4, pady=2)
+                else:
+                    w.pack_forget()
+
+        search_var.trace_add("write", _filter)
+
+        # 全選 / 清除
+        btn_bar = ctk.CTkFrame(top, fg_color="transparent")
+        btn_bar.pack(fill="x", padx=8, pady=(4, 0))
+        ctk.CTkButton(btn_bar, text="全選", width=80,
+                      command=lambda: [v.set(True) for v in chk_vars.values()]
+                      ).pack(side="left", padx=4)
+        ctk.CTkButton(btn_bar, text="清除", width=80, fg_color="gray",
+                      command=lambda: [v.set(False) for v in chk_vars.values()]
+                      ).pack(side="left", padx=4)
+
+        def apply():
+            selected = {eid for eid, v in chk_vars.items() if v.get()}
+            self._selected_emps = set() if len(selected) == len(emps) else selected
+            self._update_emp_btn()
+            self._apply_punch_filter()
+            top.destroy()
+
+        ctk.CTkButton(top, text="確定", command=apply).pack(
+            fill="x", padx=12, pady=8)
 
     # --------------------------------------------------------- suggest tab
     def _build_suggest_tab(self, tab) -> None:
