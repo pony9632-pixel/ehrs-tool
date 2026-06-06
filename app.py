@@ -25,6 +25,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from config import load_config, save_config
 from ehrs_client import DEFAULT_BASE_URL, EhrsClient
 from shift_codes_ref import SHIFT_CODES_REF
+from version import __version__
 
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
@@ -35,9 +36,14 @@ _REST_CODES = {"991"}   # 排班為休假時不列入異常偵測
 
 def _shift_times(code: str) -> tuple[str, str]:
     """從 SHIFT_CODES_REF 解析班別的表定上班/下班時間（HH:MM）。"""
-    name, _ = SHIFT_CODES_REF.get(code, ("", 3))
+    name = SHIFT_CODES_REF.get(code, ("", 3, 0.0))[0]
     m = re.search(r"(\d{2}:\d{2})-(\d{2}:\d{2})", name)
     return (m.group(1), m.group(2)) if m else ("", "")
+
+
+def _shift_hours(code: str) -> float:
+    """從 SHIFT_CODES_REF 直接取得班別時數（已含休息扣除）。"""
+    return SHIFT_CODES_REF.get(code, ("", 3, 0.0))[2]
 
 
 def _punch_mins(t: str) -> int:
@@ -83,6 +89,60 @@ def _punch_remark(clock_in: str, clock_out: str, sched_in: str, sched_out: str) 
         if co < so:
             remarks.append("早退")
     return " ".join(remarks)
+
+
+def _calc_hours(sched_in: str, sched_out: str) -> float:
+    """計算實際工時（扣除休息）。
+    ≤ 4h：不扣；> 4h 且 < 9h：扣 0.5h；≥ 9h：扣 1h。"""
+    si = _punch_mins(sched_in)
+    so = _punch_mins(sched_out)
+    if so < si:
+        so += 1440
+    total = (so - si) / 60.0
+    if total <= 4.0:
+        return total
+    return total - (1.0 if total >= 9.0 else 0.5)
+
+
+def _suggest_shifts(
+    clock_in: str, clock_out: str, shift_codes: dict,
+    preferred_hours: float = 8.0, top_n: int = 3
+) -> list[tuple]:
+    """找最適班別：實際打卡時間不會造成遲到/早退的班別 top_n 名。
+    排序規則：工時差距最小優先（同工時 → 時間最接近）。
+    回傳 [(code, sched_in, sched_out, delta_in, delta_out, hours), ...]
+    delta_in > 0 = 比排班提早到；delta_out > 0 = 比排班晚下班（加班）。
+    """
+    ci_m = _punch_mins(clock_in) if clock_in else None
+    co_m = _punch_mins(clock_out) if clock_out else None
+    if ci_m is None and co_m is None:
+        return []
+    candidates = []
+    for code in shift_codes:
+        if code in _REST_CODES:
+            continue
+        si, so = _shift_times(code)
+        if not si or not so:
+            continue
+        si_m = _punch_mins(si)
+        so_m = _punch_mins(so)
+        if so_m < si_m:
+            so_m += 1440
+        ci_a = (ci_m + 1440) if ci_m is not None and ci_m < si_m - 240 else ci_m
+        co_a = (co_m + 1440) if co_m is not None and co_m < si_m - 240 else co_m
+        d_in  = (si_m - ci_a) if ci_a is not None else 0   # + = 早到
+        d_out = (co_a - so_m) if co_a is not None else 0   # + = 加班
+        if ci_a is not None and (d_in < 0 or d_in > 120):
+            continue
+        if co_a is not None and d_out < -5:
+            continue
+        h = _shift_hours(code) or _calc_hours(si, so)
+        # 主要：工時差距（相差 0.5h = +1000 分）；次要：時間契合度
+        score = abs(h - preferred_hours) * 1000 + d_in * 0.7 + max(0, d_out) * 0.5
+        candidates.append((code, si, so, d_in, d_out, h, score))
+    candidates.sort(key=lambda x: x[6])
+    return [(c, si, so, d_in, d_out, h)
+            for c, si, so, d_in, d_out, h, _ in candidates[:top_n]]
 
 
 def _assign_single_punch(punch: str, sched_in: str, sched_out: str) -> tuple[str, str]:
@@ -171,7 +231,7 @@ class _PunchTable(tk.Frame):
 class EhrsApp(ctk.CTk):
     def __init__(self, auto_login: bool = True) -> None:
         super().__init__()
-        self.title("文中排班工具")
+        self.title(f"文中排班工具  v{__version__}")
         self.geometry("1180x700")
 
         self.client: EhrsClient | None = None
@@ -185,6 +245,8 @@ class EhrsApp(ctk.CTk):
         self._build_ui()
         if auto_login:
             self.after(250, self._do_login)
+        # 啟動 3 秒後靜默檢查更新（不阻塞 UI）
+        self.after(3000, self._check_update)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -192,6 +254,7 @@ class EhrsApp(ctk.CTk):
         self.tabview.pack(fill="both", expand=True, padx=10, pady=(10, 4))
         self._build_schedule_tab(self.tabview.add("排班"))
         self._build_punch_tab(self.tabview.add("打卡"))
+        self._build_suggest_tab(self.tabview.add("建議"))
         self._build_settings_tab(self.tabview.add("設定"))
 
         self.status = ctk.CTkLabel(self, text="就緒", anchor="w")
@@ -243,6 +306,7 @@ class EhrsApp(ctk.CTk):
         self.p_all = ctk.CTkCheckBox(bar, text="全員")
         self.p_all.select()
         self.p_abnormal = ctk.CTkCheckBox(bar, text="只顯示異常", command=self._apply_punch_filter)
+        self.p_abnormal.select()
         ctk.CTkLabel(bar, text="起").pack(side="left", padx=(8, 2))
         self.p_start.pack(side="left")
         ctk.CTkLabel(bar, text="迄").pack(side="left", padx=(10, 2))
@@ -317,6 +381,16 @@ class EhrsApp(ctk.CTk):
             return False
         return True
 
+    # -------------------------------------------------------------- 自動更新
+    def _check_update(self) -> None:
+        try:
+            from updater import start_update_check
+            start_update_check(
+                status_cb=lambda msg: self.after(0, lambda m=msg: self._set_status(m))
+            )
+        except Exception:
+            pass  # updater 模組不存在或匯入失敗時靜默略過
+
     # ---------------------------------------------------------------- login
     def _save_and_login(self) -> None:
         self.cfg = {
@@ -374,9 +448,11 @@ class EhrsApp(ctk.CTk):
         for emp in sched:
             for s in emp.shifts:
                 if s.code:
+                    existing = self.shift_codes.get(s.code, ("", 3, 0.0))
                     self.shift_codes[s.code] = (
-                        s.name or self.shift_codes.get(s.code, ("", 3))[0],
+                        s.name or existing[0],
                         s.kind if s.kind is not None else 3,
+                        existing[2] if len(existing) > 2 else 0.0,
                     )
 
     def _populate_grid(self, year: int, month: int, sched) -> None:
@@ -422,7 +498,7 @@ class EhrsApp(ctk.CTk):
 
         top = ctk.CTkToplevel(self)
         top.title("編輯排班")
-        top.geometry("380x300")
+        top.geometry("380x460")
         top.transient(self)
         top.after(60, top.grab_set)
 
@@ -433,36 +509,96 @@ class EhrsApp(ctk.CTk):
         cur_txt = f"目前:{cur.code} {cur.name}" if cur else "目前:(空白)"
         ctk.CTkLabel(top, text=cur_txt, text_color="gray").pack(pady=6)
 
-        options = ["(空白/刪除)"] + [
-            f"{c} {n}" for c, (n, _k) in sorted(self.shift_codes.items())
-        ]
-        combo = ctk.CTkComboBox(top, values=options, width=300)
-        combo.set(cur.code if cur else "")
-        combo.pack(pady=10)
-        combo.focus_set()
-        top.bind("<Return>", lambda e: save())
+        # 預先計算所有班別的上班/下班/時數
+        opt_rows: list[tuple[str, str, str, str]] = []  # (code, start, end, hours)
+        for c in sorted(self.shift_codes):
+            si, so = _shift_times(c)
+            h = _shift_hours(c) or (_calc_hours(si, so) if si and so else 0.0)
+            h_str = f"{h:g}" if h else ""
+            opt_rows.append((c, si, so, h_str))
 
-        def save():
-            raw = combo.get().strip()
+        entry = ctk.CTkEntry(top, width=360, placeholder_text="輸入班別代號…")
+        entry.pack(pady=(4, 2), padx=20)
+        if cur:
+            entry.insert(0, cur.code)
+
+        tv_wrap = tk.Frame(top)
+        tv_wrap.pack(fill="x", padx=20, pady=(0, 4))
+        tv = ttk.Treeview(tv_wrap,
+                          columns=("code", "start", "end", "hours"),
+                          show="headings", height=10, selectmode="browse")
+        tv.heading("code",  text="班別代號"); tv.column("code",  width=85, anchor="center")
+        tv.heading("start", text="上班時間"); tv.column("start", width=80, anchor="center")
+        tv.heading("end",   text="下班時間"); tv.column("end",   width=80, anchor="center")
+        tv.heading("hours", text="時數");     tv.column("hours", width=55, anchor="center")
+        sb = ttk.Scrollbar(tv_wrap, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=sb.set)
+        tv.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        def _fill(typed: str = "") -> None:
+            tv.delete(*tv.get_children())
+            t = typed.lower()
+            if not t or any(k in t for k in ("空白", "刪除")):
+                tv.insert("", "end", iid="__del__", values=("(空白/刪除)", "", "", ""))
+            for code, si, so, h in opt_rows:
+                name = self.shift_codes.get(code, ("", 3))[0]
+                if not t or t in code.lower() or t in name.lower() or t in si or t in so:
+                    tv.insert("", "end", values=(code, si, so, h))
+
+        _fill()
+
+        def _pick() -> None:
+            sel = tv.selection()
+            if sel:
+                code = str(tv.item(sel[0])["values"][0])
+                entry.delete(0, "end")
+                if code != "(空白/刪除)":
+                    entry.insert(0, code)
+
+        def _on_entry_key(event) -> None:
+            if event.keysym == "Down":
+                tv.focus_set()
+                children = tv.get_children()
+                if children:
+                    tv.selection_set(children[0])
+                    tv.focus(children[0])
+                return
+            if event.keysym == "Return":
+                save(); return
+            _fill(entry.get())
+
+        def _on_tv_key(event) -> None:
+            if event.keysym == "Return":
+                _pick(); save()
+            elif event.keysym == "Up":
+                sel = tv.selection()
+                children = tv.get_children()
+                if sel and children and sel[0] == children[0]:
+                    entry.focus_set()
+
+        entry.bind("<KeyRelease>", _on_entry_key)
+        tv.bind("<<TreeviewSelect>>", lambda e: _pick())
+        tv.bind("<KeyRelease>", _on_tv_key)
+        entry.focus_set()
+
+        def save() -> None:
+            raw = entry.get().strip()
             top.destroy()
             if not raw or raw.startswith("(空白"):
                 self._apply_delete(emp, date_str, cur)
             else:
                 self._apply_set(emp, date_str, raw.split()[0])
 
-        ctk.CTkButton(top, text="儲存", command=save).pack(pady=(6, 4))
-        ctk.CTkButton(top, text="取消", command=top.destroy, fg_color="gray").pack()
+        ctk.CTkButton(top, text="儲存", width=340, command=save).pack(pady=(4, 4), padx=20)
+        ctk.CTkButton(top, text="取消", width=340, fg_color="gray",
+                      command=top.destroy).pack(padx=20)
 
     def _apply_set(self, emp, date_str: str, code: str) -> None:
-        name, kind = self.shift_codes.get(code, ("", 3))
-        if not messagebox.askyesno(
-            "確認寫入",
-            f"將把 {emp.emp_id} {emp.name}\n{date_str} 設為 {code} {name}\n\n"
-            "這會寫入正式班表,確定?",
-        ):
-            return
         year, month, _ = (int(x) for x in date_str.split("-"))
         self._set_status("寫入中…")
+        # 排班一律 kind=3；只有排休（991）才讓系統自動偵測 kind
+        kind = None if code in _REST_CODES else 3
 
         def work():
             return self.client.set_shift(
@@ -477,11 +613,6 @@ class EhrsApp(ctk.CTk):
 
     def _apply_delete(self, emp, date_str: str, cur) -> None:
         if cur is None:
-            return
-        if not messagebox.askyesno(
-            "確認刪除",
-            f"將刪除 {emp.emp_id} {emp.name}\n{date_str} 的班 {cur.code}\n\n確定?",
-        ):
             return
         year, month, _ = (int(x) for x in date_str.split("-"))
         self._set_status("刪除中…")
@@ -636,6 +767,10 @@ class EhrsApp(ctk.CTk):
         self._set_status(f"匯入中（{len(changes)} 筆）…")
 
         def work():
+            # 排班一律 kind=3；只有排休代碼才自動偵測
+            for ch in changes:
+                if ch["shift_code"] not in _REST_CODES:
+                    ch.setdefault("kind", 3)
             return self.client.set_shifts_bulk(year, month, changes, dry_run=False)
 
         def done(results):
@@ -730,7 +865,7 @@ class EhrsApp(ctk.CTk):
             start_d = dt.date.fromisoformat(range_start)
             end_d   = dt.date.fromisoformat(range_end)
             for (emp_id, date), (code, _) in sched_map.items():
-                if code in _REST_CODES:
+                if not code or code in _REST_CODES:
                     continue
                 d = dt.date.fromisoformat(date)
                 if start_d <= d <= end_d and (emp_id, date) not in punched:
@@ -759,6 +894,196 @@ class EhrsApp(ctk.CTk):
             if not only_abnormal or any(fgs)
         ]
         self.punch_tbl.populate(filtered)
+        self.after(50, self._compute_suggestions)
+
+
+    # --------------------------------------------------------- suggest tab
+    def _build_suggest_tab(self, tab) -> None:
+        bar = ctk.CTkFrame(tab)
+        bar.pack(fill="x", padx=6, pady=6)
+        ctk.CTkLabel(bar, text="依打卡查詢結果建議最適班別（忘打卡不列入）").pack(
+            side="left", padx=8)
+        self.p_overtime = ctk.CTkCheckBox(bar, text="加班建議",
+                                          command=self._compute_suggestions)
+        self.p_overtime.pack(side="left", padx=12)
+        ctk.CTkButton(bar, text="重新計算", width=90,
+                      command=self._compute_suggestions).pack(side="left", padx=8)
+        self.suggest_scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        self.suggest_scroll.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+    def _compute_suggestions(self) -> None:
+        if not hasattr(self, "suggest_scroll"):
+            return
+        for w in self.suggest_scroll.winfo_children():
+            w.destroy()
+
+        # 遲到/早退
+        late_early = [
+            vals for vals, _ in self._punch_cache
+            if vals[8]
+            and "忘打卡" not in vals[8]
+            and any(k in vals[8] for k in ("遲到", "早退"))
+        ]
+        # 加班（勾選才顯示）
+        overtime: list[tuple] = []
+        if self.p_overtime.get():
+            for vals, _ in self._punch_cache:
+                _, _, _, _, sched_in, sched_out, clock_in, clock_out, remark = vals
+                if not clock_in or not clock_out or not sched_in or not sched_out:
+                    continue
+                if "忘打卡" in remark:
+                    continue
+                si_m = _punch_mins(sched_in)
+                so_m = _punch_mins(sched_out)
+                co_m = _punch_mins(clock_out)
+                if so_m < si_m:
+                    so_m += 1440
+                if co_m < si_m - 120:
+                    co_m += 1440
+                if co_m - so_m >= 30:   # 加班 ≥ 30 分鐘才列入
+                    overtime.append(vals)
+
+        if not late_early and not overtime:
+            ctk.CTkLabel(self.suggest_scroll,
+                         text="沒有需要建議的異常記錄（請先到打卡分頁查詢）",
+                         text_color="gray").pack(pady=24)
+            return
+
+        if late_early:
+            ctk.CTkLabel(self.suggest_scroll, text="遲到 / 早退",
+                         font=("", 13, "bold"), text_color="#555").pack(
+                anchor="w", padx=6, pady=(4, 0))
+            for vals in late_early:
+                self._build_suggest_card(vals, overtime_mode=False)
+
+        if overtime:
+            ctk.CTkLabel(self.suggest_scroll, text="加班",
+                         font=("", 13, "bold"), text_color="#555").pack(
+                anchor="w", padx=6, pady=(10, 0))
+            for vals in overtime:
+                self._build_suggest_card(vals, overtime_mode=True)
+
+    def _build_suggest_card(self, vals: tuple, overtime_mode: bool = False) -> None:
+        emp_id, name, date, shift_code, sched_in, sched_out, \
+            clock_in, clock_out, remark = vals
+        cur_h = _shift_hours(shift_code) or (_calc_hours(sched_in, sched_out) if sched_in and sched_out else 8.0)
+        if overtime_mode:
+            if clock_in and clock_out:
+                ci_m = _punch_mins(clock_in)
+                co_m = _punch_mins(clock_out)
+                si_m = _punch_mins(sched_in) if sched_in else 0
+                if co_m < si_m - 120:
+                    co_m += 1440
+                raw_h = (co_m - ci_m) / 60.0
+                actual_h = raw_h - (1.0 if raw_h >= 9.0 else 0.5)
+            else:
+                actual_h = cur_h + 1.0
+            pref_h = round(actual_h * 2) / 2   # 四捨五入到 0.5
+            sugg = [s for s in _suggest_shifts(
+                clock_in, clock_out, self.shift_codes, preferred_hours=pref_h, top_n=6)
+                if s[5] > cur_h][:3]
+            hdr_color = "#1A5E3A"
+            tag_text  = "加班建議"
+        else:
+            sugg = _suggest_shifts(clock_in, clock_out, self.shift_codes, preferred_hours=cur_h)
+            hdr_color = "#7A3B1E"
+            tag_text  = remark
+
+        outer = ctk.CTkFrame(self.suggest_scroll, corner_radius=8)
+        outer.pack(fill="x", pady=4, padx=2)
+
+        # ── 標題列 ──────────────────────────────────────────
+        hdr = ctk.CTkFrame(outer, fg_color=hdr_color, corner_radius=8)
+        hdr.pack(fill="x")
+        ctk.CTkLabel(hdr, text=f"{name}  {emp_id}",
+                     font=("", 13, "bold"), text_color="white").pack(
+            side="left", padx=12, pady=6)
+        ctk.CTkLabel(hdr, text=date, text_color="#FFDDCC").pack(side="left", padx=4)
+        ctk.CTkLabel(hdr, text=tag_text,
+                     text_color="#FFD700", font=("", 12, "bold")).pack(
+            side="right", padx=12)
+
+        # ── 應排班 vs 實際打卡 ────────────────────────────────
+        info = ctk.CTkFrame(outer, fg_color="transparent")
+        info.pack(fill="x", padx=8, pady=(6, 2))
+
+        cur_f = ctk.CTkFrame(info, fg_color="#FFF3EC", corner_radius=6)
+        cur_f.pack(side="left", fill="both", expand=True, padx=(0, 4))
+        ctk.CTkLabel(cur_f, text="應排班",
+                     text_color="gray", font=("", 11)).pack(anchor="w", padx=8, pady=(6, 0))
+        ctk.CTkLabel(cur_f, text=shift_code or "—",
+                     text_color="#CC3300", font=("", 15, "bold")).pack(anchor="w", padx=8)
+        code_name = self.shift_codes.get(shift_code, ("", 3))[0] if shift_code else ""
+        ctk.CTkLabel(cur_f, text=code_name or f"{sched_in}–{sched_out}",
+                     font=("", 11)).pack(anchor="w", padx=8)
+        if shift_code or (sched_in and sched_out):
+            disp_h = _shift_hours(shift_code) or (_calc_hours(sched_in, sched_out) if sched_in and sched_out else 0.0)
+            if disp_h:
+                ctk.CTkLabel(cur_f, text=f"{disp_h:g}h",
+                             text_color="gray").pack(anchor="w", padx=8, pady=(0, 6))
+
+        act_f = ctk.CTkFrame(info, fg_color="#F0F0FF", corner_radius=6)
+        act_f.pack(side="left", fill="both", expand=True, padx=(4, 0))
+        ctk.CTkLabel(act_f, text="實際打卡",
+                     text_color="gray", font=("", 11)).pack(anchor="w", padx=8, pady=(6, 0))
+        punch_txt = (f"{clock_in}  →  {clock_out}"
+                     if clock_in and clock_out else clock_in or clock_out or "—")
+        ctk.CTkLabel(act_f, text=punch_txt,
+                     font=("", 14, "bold"), text_color="#333399").pack(
+            anchor="w", padx=8, pady=(4, 6))
+
+        # ── 建議班別 ─────────────────────────────────────────
+        if not sugg:
+            ctk.CTkLabel(outer, text="找不到合適的班別建議",
+                         text_color="gray").pack(pady=6)
+        for i, (code, si, so, d_in, d_out, h) in enumerate(sugg):
+            row_bg = "#F9F9F9" if i % 2 == 0 else "#FFFFFF"
+            row = ctk.CTkFrame(outer, fg_color=row_bg, corner_radius=4)
+            row.pack(fill="x", padx=8, pady=1)
+
+            rank_txt = "★" if i == 0 else str(i + 1)
+            ctk.CTkLabel(row, text=rank_txt, width=24,
+                         text_color="#FF9900" if i == 0 else "#888888",
+                         font=("", 13, "bold")).pack(side="left", padx=4, pady=4)
+
+            s_name = self.shift_codes.get(code, ("", 3))[0]
+            ctk.CTkLabel(row, text=f"{code}  {s_name or f'{si}–{so}'}",
+                         width=210, anchor="w").pack(side="left", padx=4)
+            ctk.CTkLabel(row, text=f"{h:g}h",
+                         width=36, text_color="gray").pack(side="left")
+
+            parts: list[str] = []
+            if d_in > 0:
+                parts.append(f"早{d_in}分")
+            if d_out > 0:
+                parts.append(f"晚{d_out}分")
+            elif d_out < 0:
+                parts.append(f"早退{-d_out}分")
+            ctk.CTkLabel(row, text="·".join(parts),
+                         text_color="#FF6600", width=110).pack(side="left", padx=4)
+
+            ctk.CTkButton(
+                row, text="套用", width=60, height=28,
+                command=lambda eid=emp_id, dt=date, c=code: self._apply_suggestion(eid, dt, c)
+            ).pack(side="right", padx=8, pady=4)
+
+    def _apply_suggestion(self, emp_id: str, date_str: str, code: str) -> None:
+        if not self._need_client():
+            return
+        year, month, _ = (int(x) for x in date_str.split("-"))
+        self._set_status(f"套用中：{emp_id} {date_str} → {code}…")
+
+        def work():
+            return self.client.set_shift(
+                year, month, emp_id, date_str, code,
+                kind=None if code in _REST_CODES else 3,
+                dry_run=False,
+            )
+
+        def done(_):
+            self._set_status(f"已套用：{emp_id} {date_str} → {code}")
+
+        self._run_async(work, done)
 
 
 def main() -> None:

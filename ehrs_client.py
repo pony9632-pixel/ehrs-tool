@@ -417,19 +417,22 @@ class EhrsClient:
         emp_id: str,
         date: DateLike,
         shift_code: str,
-        kind: int = 3,
+        kind: Optional[int] = None,
         dry_run: bool = True,
         confirm: bool = True,
     ) -> dict:
         """建立或修改某員工某天的班別。
 
         會先抓當月班表,若該日已有班(有 pb29995)走 Update,否則走 Create。
+        kind=None(預設)時自動從班表偵測該班別代號使用的種類,找不到預設 3。
         dry_run=True(預設)只回傳 payload 不送出。
         confirm=True 時自動通過伺服器的規則提醒(例:例假數),等同 UI 點確認;
         想看到提醒就停下時設 confirm=False。
         """
         filt = self._schedule_filter(year, month)
         calendar = self.get_schedule_raw(year, month)
+        if kind is None:
+            kind = self._kind_from_calendar(calendar, shift_code, default=3)
         payload = self._build_shift_payload(
             calendar, filt, emp_id, date, shift_code, kind
         )
@@ -449,6 +452,61 @@ class EhrsClient:
             "confirmations": confirmations,
             "wpb29": result.get("wpb29") if isinstance(result, dict) else None,
         }
+
+    def _kind_from_calendar(self, calendar: dict, shift_code: str, default: int = 3) -> int:
+        for emp in calendar.get("shiftEmployees", []):
+            for cell in emp.get("cells", []):
+                for s in (cell.get("schedules") or []):
+                    if s.get("pb29005") == shift_code and s.get("pb29004") is not None:
+                        return s["pb29004"]
+        return default
+
+    def set_shifts_bulk(
+        self,
+        year: int,
+        month: int,
+        changes: list[dict],
+        dry_run: bool = True,
+        confirm: bool = True,
+    ) -> list[dict]:
+        """批次建立/修改班別,只抓一次班表。
+        changes 每筆需含 emp_id、date、shift_code,可選 kind。"""
+        filt = self._schedule_filter(year, month)
+        calendar = self.get_schedule_raw(year, month)
+        results: list[dict] = []
+        for ch in changes:
+            emp_id = ch["emp_id"]
+            date = ch["date"]
+            shift_code = ch["shift_code"]
+            kind = ch.get("kind") or self._kind_from_calendar(calendar, shift_code)
+            try:
+                payload = self._build_shift_payload(
+                    calendar, filt, emp_id, date, shift_code, kind
+                )
+            except EhrsError as exc:
+                results.append({"ok": False, "emp_id": emp_id, "date": date, "error": str(exc)})
+                continue
+            is_update = payload["wpb29"].get("pb29995") is not None
+            path = (
+                "Webm/Webm1031Wpb29/Update" if is_update
+                else "Webm/Webm1031Wpb29/Create"
+            )
+            if dry_run:
+                results.append({
+                    "dry_run": True, "endpoint": path,
+                    "emp_id": emp_id, "date": date, "shift_code": shift_code,
+                })
+                continue
+            try:
+                result, confirmations = self._post_shift_write(path, payload, confirm=confirm)
+                results.append({
+                    "ok": True, "endpoint": path,
+                    "emp_id": emp_id, "date": date, "shift_code": shift_code,
+                    "confirmations": confirmations,
+                })
+            except EhrsError as exc:
+                results.append({"ok": False, "emp_id": emp_id, "date": date, "error": str(exc)})
+        return results
 
     def delete_shift(
         self,
