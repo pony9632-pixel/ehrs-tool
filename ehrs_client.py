@@ -69,6 +69,19 @@ def _iso_ms(value: DateLike, end_of_day: bool = False) -> str:
     return f"{d.isoformat()}T{t}"
 
 
+# 四週排班期間:民國115年第1期起始 2025-12-22(週一),每期 28 天連續推算。
+_PERIOD_ANCHOR = _dt.date(2025, 12, 22)
+_PERIOD_DAYS = 28
+
+
+def _period_start_of(value: DateLike) -> _dt.date:
+    """回傳包含該日期的四週期間之起始日(週一)。
+    例:2026-07-01 → 2026-06-08(第7期 6/8～7/5 的起點)。"""
+    d = _as_date(value)
+    idx = (d - _PERIOD_ANCHOR).days // _PERIOD_DAYS
+    return _PERIOD_ANCHOR + _dt.timedelta(days=idx * _PERIOD_DAYS)
+
+
 # --------------------------------------------------------------------------- #
 # 排班資料結構
 # --------------------------------------------------------------------------- #
@@ -526,23 +539,63 @@ class EhrsClient:
     ) -> list[dict]:
         """批次建立/修改班別,並行送出請求。
         changes 每筆需含 emp_id、date、shift_code,可選 kind。
-        自動依 date 分組,跨月期間(如 6/8～7/5)各月分別抓 calendar。
+        eHRS 以「四週期間(期)」管理排班,跨月期間(如第7期 6/8～7/5)的
+        7/1～7/5 其實屬於「六月」那次查詢回來的 calendar。因此這裡會把
+        相關月份(各 date 的當月 + 前一個月)全部抓回,再針對每筆資料找出
+        同時含「該員工 + 該日格子」的 calendar 來寫入。
         progress_cb(done, total) 每處理完一筆即呼叫一次。
         max_workers 控制並行 HTTP 連線數,預設 6。"""
-        # 依各筆資料的實際年月分組,跨月自動處理
-        from collections import defaultdict
-        groups: dict[tuple[int, int], list[tuple[int, dict]]] = defaultdict(list)
-        for idx, ch in enumerate(changes):
-            y, m = int(ch["date"][:4]), int(ch["date"][5:7])
-            groups[(y, m)].append((idx, ch))
+        # 需要抓的月份:每筆 date 的當月 + 其所屬期間的「起始月」。
+        # 跨月期間(如第7期 6/8～7/5)的 7/1～7/5 屬於六月那次查詢,故需含起始月。
+        fetch_keys: set[tuple[int, int]] = set()
+        for ch in changes:
+            d = _as_date(ch["date"])
+            fetch_keys.add((d.year, d.month))
+            ps = _period_start_of(d)
+            fetch_keys.add((ps.year, ps.month))
 
-        # 每個涉及月份各抓一次 calendar（sequential，避免重複請求）
-        cal_map: dict[tuple[int, int], tuple[dict, dict]] = {}
-        for (y, m) in groups:
-            cal_map[(y, m)] = (
-                self._schedule_filter(y, m),
-                self.get_schedule_raw(y, m),
-            )
+        # 各月份只抓一次 calendar；filter 的 start/end 放寬到該 calendar 實際
+        # 含有的格子日期範圍,寫入未來日期(如 7/1)才不會被當成超出範圍。
+        cals: list[tuple[dict, dict]] = []   # (filter, calendar)
+        for (y, m) in sorted(fetch_keys):
+            try:
+                cal = self.get_schedule_raw(y, m)
+            except EhrsError:
+                continue
+            cell_dates = [
+                _as_date(c["calendarDate"])
+                for e in cal.get("shiftEmployees", [])
+                for c in e.get("cells", [])
+            ]
+            filt = self._schedule_filter(y, m)
+            if cell_dates:
+                filt = dict(
+                    filt,
+                    start=_iso_ms(min(cell_dates)),
+                    end=_iso_ms(max(cell_dates), end_of_day=True),
+                )
+            cals.append((filt, cal))
+
+        def _pick_cal(emp_id: str, date: str) -> tuple[dict | None, dict | None]:
+            """找出最適合寫入此員工此日的 (filter, calendar)。
+            優先:同時含該員工與該日格子;其次:含該員工(格子由 Create 補)。"""
+            target = _as_date(date)
+            for filt, cal in cals:
+                emp = next(
+                    (e for e in cal.get("shiftEmployees", [])
+                     if e.get("pa51002") == emp_id),
+                    None,
+                )
+                if emp and any(
+                    _as_date(c["calendarDate"]) == target
+                    for c in emp.get("cells", [])
+                ):
+                    return filt, cal
+            for filt, cal in cals:
+                if any(e.get("pa51002") == emp_id
+                       for e in cal.get("shiftEmployees", [])):
+                    return filt, cal
+            return None, None
 
         total = len(changes)
         results: list[dict | None] = [None] * total
@@ -550,11 +603,15 @@ class EhrsClient:
         lock = threading.Lock()
 
         def _process(idx: int, ch: dict) -> None:
-            y, m = int(ch["date"][:4]), int(ch["date"][5:7])
-            filt, calendar = cal_map[(y, m)]
             emp_id     = ch["emp_id"]
             date       = ch["date"]
             shift_code = ch["shift_code"]
+            filt, calendar = _pick_cal(emp_id, date)
+            if calendar is None:
+                results[idx] = {"ok": False, "emp_id": emp_id, "date": date,
+                                "error": f"找不到員工 {emp_id}(請確認該員工在此期間班表內)"}
+                _tick()
+                return
             kind = ch.get("kind") or self._kind_from_calendar(calendar, shift_code)
             try:
                 payload = self._build_shift_payload(
