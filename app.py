@@ -1677,6 +1677,10 @@ class EhrsApp(ctk.CTk):
             punch_rows = self.client.get_punch_records(
                 start, end, readable=True
             )
+            try:
+                leave_rows = self.client.get_leave_records(start, end)
+            except Exception:
+                leave_rows = []
             sched_map: dict[tuple, tuple] = {}
             emp_names: dict[str, str] = {}
             start_d = dt.date.fromisoformat(start)
@@ -1691,12 +1695,13 @@ class EhrsApp(ctk.CTk):
                 except Exception:
                     pass
                 cur = (cur.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
-            return punch_rows, sched_map, emp_names, start, end
+            return punch_rows, leave_rows, sched_map, emp_names, start, end
 
         def done(result):
-            punch_rows, sched_map, emp_names, s, e = result
+            punch_rows, leave_rows, sched_map, emp_names, s, e = result
             self._raw_punch_rows = list(punch_rows)
-            self._populate_punch(punch_rows, sched_map, emp_names, s, e)
+            self._populate_punch(punch_rows, sched_map, emp_names, s, e,
+                                 leave_rows=leave_rows)
             self._populate_raw_punch()
             self._set_status(f"打卡 {start}~{end} 共 {len(punch_rows)} 筆")
 
@@ -1709,6 +1714,7 @@ class EhrsApp(ctk.CTk):
         emp_names: dict | None = None,
         range_start: str | None = None,
         range_end: str | None = None,
+        leave_rows: list | None = None,
     ) -> None:
         # 0. 建立 emp_id -> 部門名稱 對照表（從原始打卡資料）
         for r in rows:
@@ -1752,7 +1758,20 @@ class EhrsApp(ctk.CTk):
             remark = _punch_remark(clock_in, clock_out, sched_in, sched_out)
             display.append((emp_id, name, date, code, sched_in, sched_out, clock_in, clock_out, remark))
 
-        # 2. 找出有排班但完全沒打卡的日子 → 曠職
+        # 1b. 建立 leave_map：(emp_id, date) → 假別名稱（特休/病假/事假…）
+        leave_map: dict[tuple, str] = {}
+        for lr in (leave_rows or []):
+            eid   = lr.get("pa60002", "")
+            dstr  = str(lr.get("pa60006", ""))[:10]
+            lname = lr.get("pa60004Name", "")
+            if eid and dstr and lname:
+                key = (eid, dstr)
+                if key not in leave_map:
+                    leave_map[key] = lname
+                elif lname not in leave_map[key]:
+                    leave_map[key] += f"/{lname}"
+
+        # 2. 找出有排班但完全沒打卡的日子 → 查假單；無假單才標「曠職」
         if sched_map and range_start and range_end:
             start_d = dt.date.fromisoformat(range_start)
             end_d   = dt.date.fromisoformat(range_end)
@@ -1763,15 +1782,20 @@ class EhrsApp(ctk.CTk):
                 if start_d <= d <= end_d and (emp_id, date) not in punched:
                     name = (emp_names or {}).get(emp_id, "")
                     sched_in, sched_out = _shift_times(code) if code else ("", "")
-                    display.append((emp_id, name, date, code, sched_in, sched_out, "", "", "曠職"))
+                    remark = leave_map.get((emp_id, date), "曠職")
+                    display.append((emp_id, name, date, code, sched_in, sched_out, "", "", remark))
 
-        RED = "#CC0000"
+        RED   = "#CC0000"
+        GREEN = "#2A8B5A"
+        _ERR  = ("遲到", "上班忘打卡", "早退", "下班忘打卡", "曠職")
         def _fgs(row: tuple) -> tuple:
             remark = row[8]
+            is_err   = remark and any(k in remark for k in _ERR)
+            is_leave = remark and not is_err
             ci_red = RED if remark and any(k in remark for k in ("遲到", "上班忘打卡", "曠職")) else ""
             co_red = RED if remark and any(k in remark for k in ("早退", "下班忘打卡", "曠職")) else ""
-            rm_red = RED if remark else ""
-            return ("", "", "", "", "", "", ci_red, co_red, rm_red)
+            rm_col = RED if is_err else (GREEN if is_leave else "")
+            return ("", "", "", "", "", "", ci_red, co_red, rm_col)
 
         self._punch_cache = [
             (row, _fgs(row))

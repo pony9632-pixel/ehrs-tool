@@ -240,6 +240,48 @@ class EhrsClient:
             )
         return result
 
+    # ----- 請假記錄讀取 ----- #
+    def get_leave_records(
+        self,
+        start: DateLike,
+        end: DateLike,
+        emp_status: Iterable[str] = ("1", "2"),
+    ) -> list[dict]:
+        """查詢請假記錄 (Webr3070)。
+
+        每筆記錄關鍵欄位：
+          pa60002      員工代號
+          pa60002Name  員工姓名
+          pa60004Name  假別（特休/病假/事假…）
+          pa60006      出勤日期  YYYY-MM-DDTHH:MM:SS
+          pa60007      請假開始
+          pa60008      請假結束
+          pa60011      時數（分鐘）
+        """
+        s = _as_date(start)
+        e = _as_date(end)
+        payload: dict[str, Any] = {
+            "filterMethod": 1,
+            "hourFilter": "",
+            "isDesignPreview": False,
+            "leaveName": 1,
+            "pa51011s": list(emp_status),
+            "pa60006End": _iso_ms(e, end_of_day=True),
+            "pa60006Start": _iso_ms(s),
+            "pa6002021End": _iso_ms(e, end_of_day=True),
+            "pa6002021Start": _iso_ms(s),
+            "periodFilter": 3,
+            "periodSettingEnd": _iso_ms(e, end_of_day=True),
+            "periodSettingStart": _iso_ms(s),
+            "queryMode": 1,
+            "queryModeName": "依請假日期區間",
+            "reportType": "WEBR3070RA",
+            "reportType2": "WEBR3070RA",
+            "templateId": "56dab7dd-1956-46cf-91ef-86b8ab0feafe",
+        }
+        data = self._post_json("Webr/Webr3070/BrowseResource", payload)["data"]
+        return data.get("data", [])
+
     # ----- 刷卡(打卡)讀取 ----- #
     def get_punch_records(
         self,
