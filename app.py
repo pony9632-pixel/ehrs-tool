@@ -636,6 +636,8 @@ class EhrsApp(ctk.CTk):
         self._period_start: dt.date | None = None
         self._period_end:   dt.date | None = None
         self._grid_dates:   list[dt.date]  = []
+        # 主畫面常駐員工篩選；空集合代表「全部員工」(不篩選)
+        self._sched_emp_filter: set[str] = set()
 
         # ── 民國年 ──────────────────────────────────────────
         ctk.CTkLabel(bar, text="民國", text_color=_C["ink"],
@@ -680,6 +682,11 @@ class EhrsApp(ctk.CTk):
                        fg_color=_C["muted"], hover_color="#6B7280",
                        corner_radius=8, command=self._import_schedule
                        ).pack(side="right", padx=(4, 0), pady=6)
+        self.emp_filter_btn = ctk.CTkButton(
+            bar, text="篩選員工", width=110,
+            fg_color=_C["tab_bg"], text_color=_C["ink"], hover_color=_C["line"],
+            corner_radius=8, command=self._open_sched_emp_filter)
+        self.emp_filter_btn.pack(side="right", padx=(4, 0), pady=6)
 
         # ── 排班格 ───────────────────────────────────────────
         wrap = tk.Frame(tab, bg=_C["app_bg"])
@@ -1290,6 +1297,8 @@ class EhrsApp(ctk.CTk):
         self._sched_header.set_dates(month_dates)
         emp_rows = []
         for emp in sched:
+            if not self._emp_passes_filter(emp.emp_id):
+                continue
             by_day      = {int(s.date[8:10]): s.code for s in emp.shifts}
             by_day_kind = {int(s.date[8:10]): s.kind for s in emp.shifts}
             total_h = sum(
@@ -1310,6 +1319,8 @@ class EhrsApp(ctk.CTk):
         self._sched_header.set_dates(dates)
         emp_rows = []
         for emp in sched:
+            if not self._emp_passes_filter(emp.emp_id):
+                continue
             by_date      = {s.date: s.code for s in emp.shifts}
             by_date_kind = {s.date: s.kind for s in emp.shifts}
             total_h = sum(
@@ -1554,6 +1565,8 @@ class EhrsApp(ctk.CTk):
             for i in range(4, len(dates_obj) + 4):
                 ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = 7
             for emp in self.schedule:
+                if not self._emp_passes_filter(emp.emp_id):
+                    continue
                 by_day = {s.date: s.code for s in emp.shifts}
                 total_h = sum(
                     _shift_hours(by_day[d]) for d in dates_iso
@@ -1762,15 +1775,12 @@ class EhrsApp(ctk.CTk):
             return
         first_date = next(iter(date_cols.values()))
         year, month = int(first_date[:4]), int(first_date[5:7])
-        # 收集有班別的格子，同一 emp+date 取最後一筆；同時記錄員工姓名（第 2 欄）
+        # 收集有班別的格子，同一 emp+date 取最後一筆
         seen: dict[tuple, dict] = {}
-        emp_names: dict[str, str] = {}
         for row in rows[1:]:
             if not row or not row[0]:
                 continue
             emp_id = str(row[0]).strip()
-            if len(row) > 1 and row[1]:
-                emp_names[emp_id] = str(row[1]).strip()
             for col_idx, date_str in date_cols.items():
                 raw = row[col_idx] if col_idx < len(row) else None
                 code = str(raw).strip() if raw is not None else ""
@@ -1783,21 +1793,21 @@ class EhrsApp(ctk.CTk):
             messagebox.showinfo("無班別", "沒有找到任何班別資料。")
             return
 
-        # 選擇要匯入的員工（測試用，預設全選）
-        emps = {ch["emp_id"]: emp_names.get(ch["emp_id"], "")
-                for ch in changes}
-        chosen = self._pick_import_employees(emps)
-        if chosen is None:           # 使用者關閉/取消
-            return
-        if not chosen:
-            messagebox.showinfo("未選員工", "沒有勾選任何員工，已取消匯入。")
-            return
-        changes = [ch for ch in changes if ch["emp_id"] in chosen]
-
+        # 套用主畫面員工篩選（若有設定）
+        if self._sched_emp_filter:
+            changes = [ch for ch in changes
+                       if ch["emp_id"] in self._sched_emp_filter]
+            if not changes:
+                messagebox.showinfo(
+                    "無符合員工",
+                    "目前篩選的員工在這份 Excel 中沒有班別資料。")
+                return
+        n_emps = len({ch["emp_id"] for ch in changes})
+        filt_note = "（已套用員工篩選）" if self._sched_emp_filter else ""
         if not messagebox.askyesno(
             "確認匯入",
             f"將匯入 {year}-{month:02d} 排班，共 {len(changes)} 筆"
-            f"（{len(chosen)} 位員工）。\n\n"
+            f"（{n_emps} 位員工）{filt_note}。\n\n"
             "這會寫入正式班表，確定？",
         ):
             return
@@ -1840,11 +1850,20 @@ class EhrsApp(ctk.CTk):
 
         self._run_async(work, done)
 
-    def _pick_import_employees(self, emps: dict[str, str]) -> set[str] | None:
-        """匯入前選擇要寫入的員工（測試用）。
-        預設全選；回傳勾選的 emp_id 集合，使用者關閉視窗回傳 None。"""
+    def _pick_employees(
+        self,
+        emps: dict[str, str],
+        preselect: set[str] | None = None,
+        *,
+        title: str = "選擇員工",
+        hint: str = "勾選要處理的員工",
+        ok_text: str = "確定",
+    ) -> set[str] | None:
+        """通用員工挑選對話框（主畫面篩選與匯入共用）。
+        preselect=None 代表預設全選；否則只勾選集合內的員工。
+        回傳勾選的 emp_id 集合，使用者關閉視窗回傳 None。"""
         top = ctk.CTkToplevel(self)
-        top.title("選擇要匯入的員工")
+        top.title(title)
         top.geometry("300x520")
         top.configure(fg_color=_C["app_bg"])
         top.resizable(False, True)
@@ -1853,7 +1872,7 @@ class EhrsApp(ctk.CTk):
 
         result: dict = {"value": None}
 
-        ctk.CTkLabel(top, text="只匯入勾選的員工（測試用，預設全選）",
+        ctk.CTkLabel(top, text=hint,
                       text_color=_C["muted"], font=("", 12)).pack(
             padx=12, pady=(12, 4))
 
@@ -1871,7 +1890,8 @@ class EhrsApp(ctk.CTk):
         chk_vars: dict[str, tk.BooleanVar] = {}
         chk_widgets: dict[str, ctk.CTkCheckBox] = {}
         for eid in sorted(emps):
-            var = tk.BooleanVar(value=True)
+            checked = True if preselect is None else (eid in preselect)
+            var = tk.BooleanVar(value=checked)
             label = f"{eid}  {emps[eid]}".rstrip()
             chk = ctk.CTkCheckBox(scroll, text=label,
                                    variable=var, text_color=_C["ink"])
@@ -1905,13 +1925,45 @@ class EhrsApp(ctk.CTk):
             result["value"] = {eid for eid, v in chk_vars.items() if v.get()}
             top.destroy()
 
-        ctk.CTkButton(top, text="確定匯入",
+        ctk.CTkButton(top, text=ok_text,
                        fg_color=_C["accent"], hover_color=_C["acc_h"],
                        corner_radius=9, font=("", 13, "bold"),
                        command=apply).pack(fill="x", padx=12, pady=10)
 
         top.wait_window()
         return result["value"]
+
+    # ── 主畫面員工篩選 ─────────────────────────────────────────────────────
+    def _emp_passes_filter(self, emp_id: str) -> bool:
+        """空篩選集合代表「全部」；否則只放行集合內的員工。"""
+        return not self._sched_emp_filter or emp_id in self._sched_emp_filter
+
+    def _update_emp_filter_btn(self) -> None:
+        n = len(self._sched_emp_filter)
+        self.emp_filter_btn.configure(
+            text=f"篩選：{n} 人" if n else "篩選員工"
+        )
+
+    def _open_sched_emp_filter(self) -> None:
+        if not self.schedule:
+            messagebox.showinfo("尚未載入", "請先按「載入排班」載入員工後再篩選。")
+            return
+        emps = {e.emp_id: e.name for e in self.schedule}
+        pre = self._sched_emp_filter or set(emps)   # 空=全部 → 預設全勾
+        picked = self._pick_employees(
+            emps, preselect=pre,
+            title="篩選員工",
+            hint="只顯示／匯入／匯出勾選的員工",
+            ok_text="套用篩選",
+        )
+        if picked is None:
+            return
+        # 全選 → 視為不篩選（存空集合）
+        self._sched_emp_filter = set() if len(picked) == len(emps) else picked
+        self._update_emp_filter_btn()
+        # 立即套用到目前畫面
+        if self._grid_dates:
+            self._populate_grid_period(self._grid_dates, self.schedule)
 
     # ---------------------------------------------------------------- punch
     def _query_punch(self) -> None:

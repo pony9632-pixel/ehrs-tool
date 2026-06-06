@@ -545,19 +545,28 @@ class EhrsClient:
         同時含「該員工 + 該日格子」的 calendar 來寫入。
         progress_cb(done, total) 每處理完一筆即呼叫一次。
         max_workers 控制並行 HTTP 連線數,預設 6。"""
-        # 需要抓的月份:每筆 date 的當月 + 其所屬期間的「起始月」。
-        # 跨月期間(如第7期 6/8～7/5)的 7/1～7/5 屬於六月那次查詢,故需含起始月。
-        fetch_keys: set[tuple[int, int]] = set()
+        # 要抓的「月曆月份」與「四週期間」。
+        # ① 月曆檢視(shiftType=0)只回傳當月 1 號～月底,維持既有當月寫入行為。
+        # ② 但跨月期間(如第7期 6/8～7/5)的 7/1～7/5 在任何月曆檢視都查不到
+        #    (七月月曆尚未開,回傳 0 人),必須改用「彈性週期檢視」(shiftType=1)
+        #    並把 start/end 設成該期間邊界,才會回傳 7/1～7/5 的格子。
+        #    員工依彈性工時別分散在不同 flexType,故每個期間逐一查 flexType 再合併。
+        month_keys: set[tuple[int, int]] = set()
+        period_keys: set[tuple[_dt.date, _dt.date]] = set()
         for ch in changes:
             d = _as_date(ch["date"])
-            fetch_keys.add((d.year, d.month))
+            month_keys.add((d.year, d.month))
             ps = _period_start_of(d)
-            fetch_keys.add((ps.year, ps.month))
+            pe = ps + _dt.timedelta(days=_PERIOD_DAYS - 1)
+            period_keys.add((ps, pe))
 
-        # 各月份只抓一次 calendar；filter 的 start/end 放寬到該 calendar 實際
-        # 含有的格子日期範圍,寫入未來日期(如 7/1)才不會被當成超出範圍。
+        # cals 順序很重要:月曆在前、期間在後。_pick_cal 取第一個「同時含
+        # 該員工＋該日格子」者;當月日期(如 6/15)兩邊都有,會優先用月曆 filter
+        # (維持既有可運作行為);溢出日期(如 7/1)只有期間檢視有,才落到期間。
         cals: list[tuple[dict, dict]] = []   # (filter, calendar)
-        for (y, m) in sorted(fetch_keys):
+
+        # ── ① 月曆檢視 ──────────────────────────────────────
+        for (y, m) in sorted(month_keys):
             try:
                 cal = self.get_schedule_raw(y, m)
             except EhrsError:
@@ -567,14 +576,30 @@ class EhrsClient:
                 for e in cal.get("shiftEmployees", [])
                 for c in e.get("cells", [])
             ]
-            filt = self._schedule_filter(y, m)
-            if cell_dates:
-                filt = dict(
-                    filt,
-                    start=_iso_ms(min(cell_dates)),
-                    end=_iso_ms(max(cell_dates), end_of_day=True),
-                )
+            if not cell_dates:
+                continue
+            filt = dict(
+                self._schedule_filter(y, m),
+                start=_iso_ms(min(cell_dates)),
+                end=_iso_ms(max(cell_dates), end_of_day=True),
+            )
             cals.append((filt, cal))
+
+        # ── ② 四週期間(彈性週期)檢視 ──────────────────────
+        for (ps, pe) in sorted(period_keys):
+            for ft in (2, 1, 0):   # 4週=2、雙週=1、單週=0;逐一查並合併
+                ov = dict(
+                    shiftType=1, flexType=ft,
+                    start=_iso_ms(ps), end=_iso_ms(pe, end_of_day=True),
+                )
+                try:
+                    cal = self.get_schedule_raw(ps.year, ps.month, **ov)
+                except EhrsError:
+                    continue
+                if not cal.get("shiftEmployees"):
+                    continue
+                filt = dict(self._schedule_filter(ps.year, ps.month), **ov)
+                cals.append((filt, cal))
 
         def _pick_cal(emp_id: str, date: str) -> tuple[dict | None, dict | None]:
             """找出最適合寫入此員工此日的 (filter, calendar)。
