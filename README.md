@@ -8,13 +8,13 @@
 
 ### 第一步：下載安裝檔
 
-點擊下方連結，下載 `安裝文中排班工具.command`：
+點擊下方連結，下載 `install.command`：
 
-👉 **[點我下載安裝檔](https://github.com/pony9632-pixel/ehrs-tool/releases/latest/download/安裝文中排班工具.command)**
+👉 **[點我下載安裝檔](https://github.com/pony9632-pixel/ehrs-tool/releases/latest/download/install.command)**
 
 ### 第二步：執行安裝
 
-1. 在下載的檔案上按右鍵 → **「打開」**（第一次需要這樣才能執行）
+1. 在下載的 `install.command` 上按右鍵 → **「打開」**（第一次需要這樣才能執行）
 2. 跳出確認視窗時點「打開」
 3. 等待安裝完成（約 1 分鐘）
 
