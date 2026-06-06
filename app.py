@@ -1213,7 +1213,7 @@ class EhrsApp(ctk.CTk):
 
         top = ctk.CTkToplevel(self)
         top.title("編輯排班")
-        top.geometry("400x480")
+        top.geometry("400x530")
         top.configure(fg_color=_C["app_bg"])
         top.transient(self)
         top.after(60, top.grab_set)
@@ -1247,6 +1247,22 @@ class EhrsApp(ctk.CTk):
         entry.pack(pady=(10, 4), padx=16)
         if cur:
             entry.insert(0, cur.code)
+
+        # ── 排班日種類 ────────────────────────────────────────
+        # 預設：991 系列(含 991-1)→ 2(休息日)，其他 → 3(工作日)；
+        # 若目前已有班別則沿用其 kind。
+        _dk = (cur.kind if cur is not None and cur.kind is not None
+               else (2 if _is_rest(cur.code if cur else "") else 3))
+        kind_var = tk.IntVar(value=_dk)
+        kind_bar = ctk.CTkFrame(top, fg_color=_C["tab_bg"], corner_radius=8)
+        kind_bar.pack(fill="x", padx=16, pady=(0, 4))
+        ctk.CTkLabel(kind_bar, text="排班日種類：",
+                      text_color=_C["ink"], font=("", 12)
+                      ).pack(side="left", padx=(10, 6), pady=6)
+        for _lbl, _val in [("工作日 (3)", 3), ("休息日 (2)", 2), ("例假 (1)", 1)]:
+            ctk.CTkRadioButton(kind_bar, text=_lbl, variable=kind_var, value=_val,
+                                text_color=_C["ink"], font=("", 12)
+                                ).pack(side="left", padx=8, pady=6)
 
         tv_wrap = tk.Frame(top, bg=_C["app_bg"])
         tv_wrap.pack(fill="x", padx=16, pady=(0, 4))
@@ -1314,7 +1330,7 @@ class EhrsApp(ctk.CTk):
             if not raw or raw.startswith("(空白"):
                 self._apply_delete(emp, date_str, cur)
             else:
-                self._apply_set(emp, date_str, raw.split()[0])
+                self._apply_set(emp, date_str, raw.split()[0], kind_var.get())
 
         btn_row = ctk.CTkFrame(top, fg_color="transparent")
         btn_row.pack(fill="x", padx=16, pady=(0, 16))
@@ -1327,16 +1343,10 @@ class EhrsApp(ctk.CTk):
                        corner_radius=9, font=("", 13, "bold"),
                        command=save).pack(side="left")
 
-    def _apply_set(self, emp, date_str: str, code: str) -> None:
+    def _apply_set(self, emp, date_str: str, code: str, kind: int = 3) -> None:
         year, month, _ = (int(x) for x in date_str.split("-"))
         self._set_status("寫入中…")
-        # 保留該員工當天現有班別的日種類（pb29004），避免誤把「休息日/例假」改成「工作日」。
-        # 排休(991) 用 None 讓 server 自動偵測；一般班別先看舊班的 kind，找不到才預設 3。
-        if _is_rest(code):
-            kind = None
-        else:
-            cur = emp.shift_on(date_str)
-            kind = (cur.kind if cur is not None and cur.kind is not None else 3)
+        # kind 由 UI 選擇器傳入（工作日=3 / 休息日=2 / 例假=1）
 
         def work():
             return self.client.set_shift(
@@ -1978,6 +1988,26 @@ class EhrsApp(ctk.CTk):
                       font=("", 14, "bold"), text_color=_C["ink"]).pack(
             anchor="w", padx=10, pady=(4, 8))
 
+        # ── 排班日種類選擇（一張卡共用，所有套用按鈕均沿用） ──────
+        # 預設：991 系列 → 2(休息日)，其他 → 3(工作日)；若已有班則取其 kind。
+        _default_k = 2 if _is_rest(shift_code) else 3
+        for _emp_obj in (self.schedule or []):
+            if _emp_obj.emp_id == emp_id:
+                _ex = _emp_obj.shift_on(date)
+                if _ex is not None and _ex.kind is not None:
+                    _default_k = _ex.kind
+                break
+        kind_var = tk.IntVar(value=_default_k)
+        kind_bar = ctk.CTkFrame(outer, fg_color=_C["tab_bg"], corner_radius=8)
+        kind_bar.pack(fill="x", padx=12, pady=(0, 4))
+        ctk.CTkLabel(kind_bar, text="排班日種類：",
+                      text_color=_C["ink"], font=("", 11)
+                      ).pack(side="left", padx=(10, 6), pady=5)
+        for _lbl, _val in [("工作日 (3)", 3), ("休息日 (2)", 2), ("例假 (1)", 1)]:
+            ctk.CTkRadioButton(kind_bar, text=_lbl, variable=kind_var, value=_val,
+                                text_color=_C["ink"], font=("", 11)
+                                ).pack(side="left", padx=8, pady=5)
+
         # ── 建議班別 ─────────────────────────────────────────
         if not sugg:
             ctk.CTkLabel(outer, text="找不到合適的班別建議",
@@ -2013,27 +2043,14 @@ class EhrsApp(ctk.CTk):
                 row, text="套用", width=60, height=28,
                 fg_color=_C["accent"], hover_color=_C["acc_h"],
                 corner_radius=6, font=("", 12),
-                command=lambda eid=emp_id, dt=date, c=code: self._apply_suggestion(eid, dt, c)
+                command=lambda eid=emp_id, dt=date, c=code, kv=kind_var: self._apply_suggestion(eid, dt, c, kv.get())
             ).pack(side="right", padx=8, pady=5)
 
-    def _apply_suggestion(self, emp_id: str, date_str: str, code: str) -> None:
+    def _apply_suggestion(self, emp_id: str, date_str: str, code: str, kind: int = 3) -> None:
         if not self._need_client():
             return
         year, month, _ = (int(x) for x in date_str.split("-"))
-        self._set_status(f"套用中：{emp_id} {date_str} → {code}…")
-
-        # 從已載入的班表取得該員工當天的日種類（pb29004），
-        # 確保排班/例假/休息日類型不被更動，只替換班別代號。
-        if _is_rest(code):
-            kind: int | None = None
-        else:
-            kind = 3  # 預設工作日
-            for emp_obj in (self.schedule or []):
-                if emp_obj.emp_id == emp_id:
-                    cur = emp_obj.shift_on(date_str)
-                    if cur is not None and cur.kind is not None:
-                        kind = cur.kind
-                    break
+        self._set_status(f"套用中：{emp_id} {date_str} → {code}（日種類={kind}）…")
 
         def work():
             return self.client.set_shift(
