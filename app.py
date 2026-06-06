@@ -31,7 +31,11 @@ ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
 _WEEK = "一二三四五六日"
-_REST_CODES = {"991"}   # 排班為休假時不列入異常偵測
+
+
+def _is_rest(code: str) -> bool:
+    """排休班別判斷：991 及 991-x 開頭的都算排休。"""
+    return bool(code) and code.startswith("991")
 
 
 def _shift_times(code: str) -> tuple[str, str]:
@@ -119,7 +123,7 @@ def _suggest_shifts(
         return []
     candidates = []
     for code in shift_codes:
-        if code in _REST_CODES:
+        if _is_rest(code):
             continue
         si, so = _shift_times(code)
         if not si or not so:
@@ -598,7 +602,7 @@ class EhrsApp(ctk.CTk):
         year, month, _ = (int(x) for x in date_str.split("-"))
         self._set_status("寫入中…")
         # 排班一律 kind=3；只有排休（991）才讓系統自動偵測 kind
-        kind = None if code in _REST_CODES else 3
+        kind = None if _is_rest(code) else 3
 
         def work():
             return self.client.set_shift(
@@ -769,7 +773,7 @@ class EhrsApp(ctk.CTk):
         def work():
             # 排班一律 kind=3；只有排休代碼才自動偵測
             for ch in changes:
-                if ch["shift_code"] not in _REST_CODES:
+                if not _is_rest(ch["shift_code"]):
                     ch.setdefault("kind", 3)
             return self.client.set_shifts_bulk(year, month, changes, dry_run=False)
 
@@ -865,7 +869,7 @@ class EhrsApp(ctk.CTk):
             start_d = dt.date.fromisoformat(range_start)
             end_d   = dt.date.fromisoformat(range_end)
             for (emp_id, date), (code, _) in sched_map.items():
-                if not code or code in _REST_CODES:
+                if not code or _is_rest(code):
                     continue
                 d = dt.date.fromisoformat(date)
                 if start_d <= d <= end_d and (emp_id, date) not in punched:
@@ -1076,7 +1080,7 @@ class EhrsApp(ctk.CTk):
         def work():
             return self.client.set_shift(
                 year, month, emp_id, date_str, code,
-                kind=None if code in _REST_CODES else 3,
+                kind=None if _is_rest(code) else 3,
                 dry_run=False,
             )
 
