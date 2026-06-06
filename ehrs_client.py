@@ -32,6 +32,8 @@
 from __future__ import annotations
 
 import datetime as _dt
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional, Union
 
@@ -520,17 +522,22 @@ class EhrsClient:
         dry_run: bool = True,
         confirm: bool = True,
         progress_cb=None,        # Callable[[done: int, total: int], None]
+        max_workers: int = 8,
     ) -> list[dict]:
-        """批次建立/修改班別,只抓一次班表。
+        """批次建立/修改班別,只抓一次班表,並行送出請求。
         changes 每筆需含 emp_id、date、shift_code,可選 kind。
-        progress_cb(done, total) 每處理完一筆即呼叫一次。"""
+        progress_cb(done, total) 每處理完一筆即呼叫一次。
+        max_workers 控制並行 HTTP 連線數,預設 8。"""
         filt = self._schedule_filter(year, month)
         calendar = self.get_schedule_raw(year, month)
-        results: list[dict] = []
         total = len(changes)
-        for i, ch in enumerate(changes, 1):
+        results: list[dict | None] = [None] * total
+        done_count = [0]
+        lock = threading.Lock()
+
+        def _process(idx: int, ch: dict) -> None:
             emp_id = ch["emp_id"]
-            date = ch["date"]
+            date   = ch["date"]
             shift_code = ch["shift_code"]
             kind = ch.get("kind") or self._kind_from_calendar(calendar, shift_code)
             try:
@@ -538,35 +545,45 @@ class EhrsClient:
                     calendar, filt, emp_id, date, shift_code, kind
                 )
             except EhrsError as exc:
-                results.append({"ok": False, "emp_id": emp_id, "date": date, "error": str(exc)})
-                if progress_cb:
-                    progress_cb(i, total)
-                continue
+                results[idx] = {"ok": False, "emp_id": emp_id, "date": date, "error": str(exc)}
+                _tick()
+                return
             is_update = payload["wpb29"].get("pb29995") is not None
             path = (
                 "Webm/Webm1031Wpb29/Update" if is_update
                 else "Webm/Webm1031Wpb29/Create"
             )
             if dry_run:
-                results.append({
+                results[idx] = {
                     "dry_run": True, "endpoint": path,
                     "emp_id": emp_id, "date": date, "shift_code": shift_code,
-                })
-                if progress_cb:
-                    progress_cb(i, total)
-                continue
+                }
+                _tick()
+                return
             try:
                 result, confirmations = self._post_shift_write(path, payload, confirm=confirm)
-                results.append({
+                results[idx] = {
                     "ok": True, "endpoint": path,
                     "emp_id": emp_id, "date": date, "shift_code": shift_code,
                     "confirmations": confirmations,
-                })
+                }
             except EhrsError as exc:
-                results.append({"ok": False, "emp_id": emp_id, "date": date, "error": str(exc)})
+                results[idx] = {"ok": False, "emp_id": emp_id, "date": date, "error": str(exc)}
+            _tick()
+
+        def _tick() -> None:
             if progress_cb:
-                progress_cb(i, total)
-        return results
+                with lock:
+                    done_count[0] += 1
+                    n = done_count[0]
+                progress_cb(n, total)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_process, i, ch) for i, ch in enumerate(changes)]
+            for f in as_completed(futures):
+                f.result()   # re-raise any unexpected exception
+
+        return [r for r in results if r is not None]
 
     def delete_shift(
         self,
