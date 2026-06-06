@@ -269,8 +269,6 @@ class EhrsApp(ctk.CTk):
         self._build_ui()
         if auto_login:
             self.after(250, self._do_login)
-        # 啟動 3 秒後靜默檢查更新（不阻塞 UI）
-        self.after(3000, self._check_update)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
