@@ -1249,17 +1249,17 @@ class EhrsApp(ctk.CTk):
             entry.insert(0, cur.code)
 
         # ── 排班日種類 ────────────────────────────────────────
-        # 預設：991 系列(含 991-1)→ 2(休息日)，其他 → 3(工作日)；
+        # 預設：991 系列(含 991-1)→ 3(排休)，其他 → 1(工作日)；
         # 若目前已有班別則沿用其 kind。
         _dk = (cur.kind if cur is not None and cur.kind is not None
-               else (2 if _is_rest(cur.code if cur else "") else 3))
+               else (3 if _is_rest(cur.code if cur else "") else 1))
         kind_var = tk.IntVar(value=_dk)
         kind_bar = ctk.CTkFrame(top, fg_color=_C["tab_bg"], corner_radius=8)
         kind_bar.pack(fill="x", padx=16, pady=(0, 4))
         ctk.CTkLabel(kind_bar, text="排班日種類：",
                       text_color=_C["ink"], font=("", 12)
                       ).pack(side="left", padx=(10, 6), pady=6)
-        for _lbl, _val in [("工作日 (3)", 3), ("休息日 (2)", 2), ("例假 (1)", 1)]:
+        for _lbl, _val in [("工作日 (1)", 1), ("休息日 (2)", 2), ("排休 (3)", 3)]:
             ctk.CTkRadioButton(kind_bar, text=_lbl, variable=kind_var, value=_val,
                                 text_color=_C["ink"], font=("", 12)
                                 ).pack(side="left", padx=8, pady=6)
@@ -1343,10 +1343,10 @@ class EhrsApp(ctk.CTk):
                        corner_radius=9, font=("", 13, "bold"),
                        command=save).pack(side="left")
 
-    def _apply_set(self, emp, date_str: str, code: str, kind: int = 3) -> None:
+    def _apply_set(self, emp, date_str: str, code: str, kind: int = 1) -> None:
         year, month, _ = (int(x) for x in date_str.split("-"))
         self._set_status("寫入中…")
-        # kind 由 UI 選擇器傳入（工作日=3 / 休息日=2 / 例假=1）
+        # kind 由 UI 選擇器傳入（工作日=1 / 休息日=2 / 排休=3）
 
         def work():
             return self.client.set_shift(
@@ -1989,8 +1989,8 @@ class EhrsApp(ctk.CTk):
             anchor="w", padx=10, pady=(4, 8))
 
         # ── 排班日種類選擇（一張卡共用，所有套用按鈕均沿用） ──────
-        # 預設：991 系列 → 2(休息日)，其他 → 3(工作日)；若已有班則取其 kind。
-        _default_k = 2 if _is_rest(shift_code) else 3
+        # 預設：991 系列 → 3(排休)，其他 → 1(工作日)；若已有班則取其 kind。
+        _default_k = 3 if _is_rest(shift_code) else 1
         for _emp_obj in (self.schedule or []):
             if _emp_obj.emp_id == emp_id:
                 _ex = _emp_obj.shift_on(date)
@@ -2003,7 +2003,7 @@ class EhrsApp(ctk.CTk):
         ctk.CTkLabel(kind_bar, text="排班日種類：",
                       text_color=_C["ink"], font=("", 11)
                       ).pack(side="left", padx=(10, 6), pady=5)
-        for _lbl, _val in [("工作日 (3)", 3), ("休息日 (2)", 2), ("例假 (1)", 1)]:
+        for _lbl, _val in [("工作日 (1)", 1), ("休息日 (2)", 2), ("排休 (3)", 3)]:
             ctk.CTkRadioButton(kind_bar, text=_lbl, variable=kind_var, value=_val,
                                 text_color=_C["ink"], font=("", 11)
                                 ).pack(side="left", padx=8, pady=5)
@@ -2046,7 +2046,7 @@ class EhrsApp(ctk.CTk):
                 command=lambda eid=emp_id, dt=date, c=code, kv=kind_var: self._apply_suggestion(eid, dt, c, kv.get())
             ).pack(side="right", padx=8, pady=5)
 
-    def _apply_suggestion(self, emp_id: str, date_str: str, code: str, kind: int = 3) -> None:
+    def _apply_suggestion(self, emp_id: str, date_str: str, code: str, kind: int = 1) -> None:
         if not self._need_client():
             return
         year, month, _ = (int(x) for x in date_str.split("-"))
