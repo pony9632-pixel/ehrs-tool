@@ -47,6 +47,13 @@ _C = {
 }
 
 _WEEK = "一二三四五六日"
+_EXCEL_SHEET_BAD_CHARS = re.compile(r"[\[\]\*\?/\\:]")
+
+
+def _excel_sheet_title(title: str) -> str:
+    """Return a valid Excel worksheet title."""
+    cleaned = _EXCEL_SHEET_BAD_CHARS.sub("-", title).strip().strip("'")
+    return (cleaned or "Sheet")[:31]
 
 
 def _get_schedule_periods(roc_year: int) -> list[tuple[dt.date, dt.date]]:
@@ -1472,13 +1479,13 @@ class EhrsApp(ctk.CTk):
             dates_obj = self._grid_dates
             s, e = dates_obj[0], dates_obj[-1]
             default_name = f"排班_{s.year}-{s.month:02d}{s.day:02d}_{e.month:02d}{e.day:02d}.xlsx"
-            sheet_title  = f"{s.month}/{s.day}～{e.month}/{e.day}"
+            sheet_title  = _excel_sheet_title(f"{s.month}-{s.day}～{e.month}-{e.day}")
         else:
             year, month = int(self.year_var.get()), int(self.month_var.get())
             ndays       = _cal.monthrange(year, month)[1]
             dates_obj   = [dt.date(year, month, d) for d in range(1, ndays + 1)]
             default_name = f"排班_{year}-{month:02d}.xlsx"
-            sheet_title  = f"{year}-{month:02d}"
+            sheet_title  = _excel_sheet_title(f"{year}-{month:02d}")
 
         path = filedialog.asksaveasfilename(
             defaultextension=".xlsx",
@@ -1488,40 +1495,45 @@ class EhrsApp(ctk.CTk):
         if not path:
             return
 
-        dates_iso = [d.isoformat() for d in dates_obj]
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = sheet_title
-        ws.append(["員工代號", "員工姓名", "總時數"] + dates_iso)
-        hdr_fill   = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-        wkend_fill = PatternFill(start_color="FFE0E0", end_color="FFE0E0", fill_type="solid")
-        for cell in ws[1]:
-            cell.font      = Font(bold=True)
-            cell.alignment = Alignment(horizontal="center", wrap_text=True)
-            cell.fill      = hdr_fill
-        ws.row_dimensions[1].height = 36
-        for col_i, d in enumerate(dates_obj, start=4):   # 日期欄從第 4 欄開始
-            if d.weekday() >= 5:
-                ws.cell(1, col_i).fill = wkend_fill
-        ws.column_dimensions["A"].width = 10
-        ws.column_dimensions["B"].width = 10
-        ws.column_dimensions["C"].width = 8    # 總時數
-        for i in range(4, len(dates_obj) + 4):
-            ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = 7
-        for emp in self.schedule:
-            by_day = {s.date: s.code for s in emp.shifts}
-            total_h = sum(
-                _shift_hours(by_day[d]) for d in dates_iso
-                if d in by_day and by_day[d] and not _is_rest(by_day[d])
-            )
-            h_str = f"{total_h:g}" if total_h else ""
-            ws.append([emp.emp_id, emp.name, h_str] + [by_day.get(d, "") for d in dates_iso])
-        for row in ws.iter_rows(min_row=2):
-            for cell in row:
-                cell.alignment = Alignment(horizontal="center")
-            row[0].alignment = Alignment(horizontal="left")
-            row[1].alignment = Alignment(horizontal="left")
-        wb.save(path)
+        try:
+            dates_iso = [d.isoformat() for d in dates_obj]
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = sheet_title
+            ws.append(["員工代號", "員工姓名", "總時數"] + dates_iso)
+            hdr_fill   = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+            wkend_fill = PatternFill(start_color="FFE0E0", end_color="FFE0E0", fill_type="solid")
+            for cell in ws[1]:
+                cell.font      = Font(bold=True)
+                cell.alignment = Alignment(horizontal="center", wrap_text=True)
+                cell.fill      = hdr_fill
+            ws.row_dimensions[1].height = 36
+            for col_i, d in enumerate(dates_obj, start=4):   # 日期欄從第 4 欄開始
+                if d.weekday() >= 5:
+                    ws.cell(1, col_i).fill = wkend_fill
+            ws.column_dimensions["A"].width = 10
+            ws.column_dimensions["B"].width = 10
+            ws.column_dimensions["C"].width = 8    # 總時數
+            for i in range(4, len(dates_obj) + 4):
+                ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = 7
+            for emp in self.schedule:
+                by_day = {s.date: s.code for s in emp.shifts}
+                total_h = sum(
+                    _shift_hours(by_day[d]) for d in dates_iso
+                    if d in by_day and by_day[d] and not _is_rest(by_day[d])
+                )
+                h_str = f"{total_h:g}" if total_h else ""
+                ws.append([emp.emp_id, emp.name, h_str] + [by_day.get(d, "") for d in dates_iso])
+            for row in ws.iter_rows(min_row=2):
+                for cell in row:
+                    cell.alignment = Alignment(horizontal="center")
+                row[0].alignment = Alignment(horizontal="left")
+                row[1].alignment = Alignment(horizontal="left")
+            wb.save(path)
+        except Exception as exc:
+            self._set_status("匯出排班失敗")
+            messagebox.showerror("匯出失敗", str(exc))
+            return
         self._set_status(f"已匯出排班 → {path}")
 
     def _export_punch(self) -> None:
