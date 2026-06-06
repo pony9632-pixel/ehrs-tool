@@ -336,7 +336,13 @@ class EhrsApp(ctk.CTk):
         self.p_start.insert(0, today.replace(day=1).isoformat())
         self.p_end = ctk.CTkEntry(bar, width=110)
         self.p_end.insert(0, today.isoformat())
-        self._selected_emps: set[str] = set()   # empty = 全員
+        self._selected_emps: set[str] = set()    # empty = 全員
+        self._selected_depts: set[str] = set()   # empty = 全部門
+        self._emp_dept: dict[str, str] = {}      # emp_id -> 部門名稱
+        self.p_dept_btn = ctk.CTkButton(
+            bar, text="部門：全部 ▼", width=130, fg_color="#5B7FA6",
+            command=self._open_dept_picker
+        )
         self.p_emp_btn = ctk.CTkButton(
             bar, text="員工：全員 ▼", width=130, fg_color="#5B7FA6",
             command=self._open_emp_picker
@@ -347,7 +353,8 @@ class EhrsApp(ctk.CTk):
         self.p_start.pack(side="left")
         ctk.CTkLabel(bar, text="迄").pack(side="left", padx=(10, 2))
         self.p_end.pack(side="left")
-        self.p_emp_btn.pack(side="left", padx=(10, 0))
+        self.p_dept_btn.pack(side="left", padx=(10, 0))
+        self.p_emp_btn.pack(side="left", padx=(6, 0))
         self.p_abnormal.pack(side="left", padx=10)
         ctk.CTkButton(bar, text="查詢打卡", command=self._query_punch).pack(
             side="left", padx=12
@@ -892,6 +899,13 @@ class EhrsApp(ctk.CTk):
         range_start: str | None = None,
         range_end: str | None = None,
     ) -> None:
+        # 0. 建立 emp_id -> 部門名稱 對照表（從原始打卡資料）
+        for r in rows:
+            eid = r.get("員工代號", "")
+            dept = r.get("部門名稱") or r.get("pa51014FullName", "")
+            if eid and dept:
+                self._emp_dept[eid] = dept
+
         # 1. 整理有打卡的日子
         sorted_rows = sorted(rows, key=lambda r: (
             r.get("員工代號", ""),
@@ -958,17 +972,69 @@ class EhrsApp(ctk.CTk):
         only_abnormal = self.p_abnormal.get()
         filtered = [
             (vals, fgs) for vals, fgs in self._punch_cache
-            if (not self._selected_emps or vals[0] in self._selected_emps)
+            if (not self._selected_depts or
+                self._emp_dept.get(vals[0], "") in self._selected_depts)
+            and (not self._selected_emps or vals[0] in self._selected_emps)
             and (not only_abnormal or any(fgs))
         ]
         self.punch_tbl.populate(filtered)
         self.after(50, self._compute_suggestions)
+
+    def _update_dept_btn(self) -> None:
+        n = len(self._selected_depts)
+        self.p_dept_btn.configure(
+            text="部門：全部 ▼" if n == 0 else f"部門：已選 {n} ▼"
+        )
 
     def _update_emp_btn(self) -> None:
         n = len(self._selected_emps)
         self.p_emp_btn.configure(
             text="員工：全員 ▼" if n == 0 else f"員工：已選 {n} 人 ▼"
         )
+
+    def _open_dept_picker(self) -> None:
+        # 從 _emp_dept 收集所有不重複部門
+        depts = sorted(set(self._emp_dept.values()))
+        if not depts:
+            messagebox.showinfo("提示", "請先查詢打卡資料。")
+            return
+
+        top = ctk.CTkToplevel(self)
+        top.title("選擇部門")
+        top.geometry("240x380")
+        top.resizable(False, True)
+        top.transient(self)
+        top.after(60, top.grab_set)
+
+        scroll = ctk.CTkScrollableFrame(top, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=8, pady=(12, 0))
+
+        chk_vars: dict[str, tk.BooleanVar] = {}
+        for dept in depts:
+            init = (not self._selected_depts) or (dept in self._selected_depts)
+            var = tk.BooleanVar(value=init)
+            ctk.CTkCheckBox(scroll, text=dept, variable=var).pack(
+                anchor="w", padx=4, pady=3)
+            chk_vars[dept] = var
+
+        btn_bar = ctk.CTkFrame(top, fg_color="transparent")
+        btn_bar.pack(fill="x", padx=8, pady=(4, 0))
+        ctk.CTkButton(btn_bar, text="全選", width=80,
+                      command=lambda: [v.set(True) for v in chk_vars.values()]
+                      ).pack(side="left", padx=4)
+        ctk.CTkButton(btn_bar, text="清除", width=80, fg_color="gray",
+                      command=lambda: [v.set(False) for v in chk_vars.values()]
+                      ).pack(side="left", padx=4)
+
+        def apply():
+            selected = {d for d, v in chk_vars.items() if v.get()}
+            self._selected_depts = set() if len(selected) == len(depts) else selected
+            self._update_dept_btn()
+            self._apply_punch_filter()
+            top.destroy()
+
+        ctk.CTkButton(top, text="確定", command=apply).pack(
+            fill="x", padx=12, pady=8)
 
     def _open_emp_picker(self) -> None:
         # 從打卡快取收集所有員工
