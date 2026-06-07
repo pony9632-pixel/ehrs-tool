@@ -82,6 +82,24 @@ def _period_start_of(value: DateLike) -> _dt.date:
     return _PERIOD_ANCHOR + _dt.timedelta(days=idx * _PERIOD_DAYS)
 
 
+# 寫入時伺服器會逐一回傳這些「跳過/確認某項驗證」的旗標(每回合一個,
+# 一格要來回近 10 趟)。confirm=True 本就是「全部按確定」,故第一趟就把
+# 整串旗標 + selected 一次帶上,讓伺服器一次過關 → 把 ~10 趟壓成 1 趟。
+# 這只改 round-trip 次數,不改寫入結果(原本逐回合也是全部確認)。
+# 清單外若出現新旗標,_post_shift_write 的迴圈仍會逐回合補上(後援)。
+_WRITE_CONFIRM_FLAGS = (
+    "isCheckOverTime",
+    "isCheckCanNotWorkingTime",
+    "isCheckScheduleIntervals",
+    "isCheckAllowConsecutive",
+    "isCheckTotalWorkingHoursOfWeek",
+    "isCheckPeriodicOverTime",
+    "isCheckPeriodicHolidays",
+    "isCheckPeriodic2WeekHolidays",
+    "isCheckPeriodic1WeekHolidays",
+)
+
+
 # --------------------------------------------------------------------------- #
 # 排班資料結構
 # --------------------------------------------------------------------------- #
@@ -447,6 +465,13 @@ class EhrsClient:
         回傳 (最後一次的 data 內層, 期間自動確認過的提醒清單)。
         """
         data = dict(payload)
+        # confirm=True 時預先帶齊所有已知確認旗標,讓伺服器一趟就過(原本
+        # 一回合只補一個旗標,要來回近 10 趟)。confirm=False 不預設,維持
+        # 「遇到第一個需確認就停下丟例外」的行為。
+        if confirm:
+            for f in _WRITE_CONFIRM_FLAGS:
+                data[f] = True
+            data["selected"] = True
         confirmations: list[dict] = []
         for _ in range(max_rounds):
             envelope = self._post_json(path, data)
@@ -544,7 +569,9 @@ class EhrsClient:
         相關月份(各 date 的當月 + 前一個月)全部抓回,再針對每筆資料找出
         同時含「該員工 + 該日格子」的 calendar 來寫入。
         progress_cb(done, total) 每處理完一筆即呼叫一次。
-        max_workers 控制並行 HTTP 連線數,預設 6。"""
+        max_workers 控制並行 HTTP 連線數,預設 6。注意:eHRS 同一 session 的
+        寫入會被伺服器序列化(ASP.NET session 鎖),調高 workers 幾乎不會更快,
+        匯入加速主要來自每格寫入的確認回合從 ~10 趟壓成 1 趟(見 _post_shift_write)。"""
         # 要抓的「月曆月份」與「四週期間」。
         # ① 月曆檢視(shiftType=0)只回傳當月 1 號～月底,維持既有當月寫入行為。
         # ② 但跨月期間(如第7期 6/8～7/5)的 7/1～7/5 在任何月曆檢視都查不到
