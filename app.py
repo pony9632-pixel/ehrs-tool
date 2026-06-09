@@ -687,6 +687,11 @@ class EhrsApp(ctk.CTk):
             fg_color=_C["tab_bg"], text_color=_C["ink"], hover_color=_C["line"],
             corner_radius=8, command=self._open_sched_emp_filter)
         self.emp_filter_btn.pack(side="right", padx=(4, 0), pady=6)
+        ctk.CTkButton(
+            bar, text="特休餘額", width=100,
+            fg_color=_C["accent"], hover_color=_C["acc_h"],
+            corner_radius=8, command=self._show_annual_leave
+            ).pack(side="right", padx=(4, 0), pady=6)
 
         # ── 排班格 ───────────────────────────────────────────
         wrap = tk.Frame(tab, bg=_C["app_bg"])
@@ -1729,6 +1734,182 @@ class EhrsApp(ctk.CTk):
             try:
                 wb.save(path)
                 messagebox.showinfo("完成", f"已匯出 {len(rows)} 人統計 → {path}",
+                                    parent=top)
+            except Exception as exc:
+                messagebox.showerror("匯出失敗", str(exc), parent=top)
+
+        ctk.CTkButton(top, text="匯出 Excel", width=120,
+                       fg_color=_C["muted"], hover_color="#6B7280",
+                       corner_radius=8, command=_export).pack(pady=8)
+
+    # -------------------------------------------------------------- 特休餘額
+    def _show_annual_leave(self) -> None:
+        """彈出視窗顯示所有(或已篩選)員工的特休剩餘天數與到期日期。"""
+        if not self._need_client():
+            return
+        if not self.schedule:
+            messagebox.showinfo("尚未載入", "請先按「載入排班」載入員工後再查特休。")
+            return
+
+        # 套用主畫面員工篩選(空集合=全部員工)
+        emps = []
+        for e in self.schedule:
+            if self._sched_emp_filter and e.emp_id not in self._sched_emp_filter:
+                continue
+            emps.append({
+                "emp_id": e.emp_id,
+                "name": e.name,
+                "dept": (e.raw or {}).get("pa51014") or "68",
+            })
+        if not emps:
+            messagebox.showinfo("無員工", "目前篩選後沒有員工可查。")
+            return
+
+        self._set_status("查詢特休中…")
+        self._show_progress(0, len(emps))
+
+        def work():
+            def on_progress(done_n: int, total: int) -> None:
+                self.after(0, lambda d=done_n, t=total: (
+                    self._show_progress(d, t),
+                    self._set_status(f"查詢特休中  {d} / {t}"),
+                ))
+            return self.client.get_annual_leave_balance_bulk(
+                emps, progress_cb=on_progress
+            )
+
+        def done(rows):
+            self._hide_progress()
+            self._set_status(f"特休查詢完成:{len(emps)} 位員工")
+            self._render_annual_leave_window(rows)
+
+        self._run_async(work, done)
+
+    def _render_annual_leave_window(self, rows: list) -> None:
+        today = dt.date.today()
+
+        def _fmt_date(s) -> str:
+            s = str(s or "").strip()
+            return s[:10] if len(s) >= 10 else s
+
+        def _soon(end_str, left_days) -> bool:
+            try:
+                ed = dt.date.fromisoformat(_fmt_date(end_str))
+            except ValueError:
+                return False
+            try:
+                ld = float(left_days)
+            except (TypeError, ValueError):
+                ld = 0.0
+            return ld > 0 and today <= ed <= today + dt.timedelta(days=90)
+
+        _COLS = [
+            ("員工代號", 80), ("員工姓名", 90), ("年度", 55), ("年資", 70),
+            ("剩餘天數", 75), ("剩餘時數", 75), ("給假天數", 75), ("已用天數", 75),
+            ("啟用日期", 95), ("到期日期", 95), ("備註", 130),
+        ]
+        col_ids = [f"c{i}" for i in range(len(_COLS))]
+
+        # 攤平成顯示用 tuple,並標記底色 tag
+        disp = []
+        for r in rows:
+            note = r.get("note") or r.get("error") or ""
+            left_min = r.get("left_minutes") or 0
+            left_h = round(left_min / 60, 1) if left_min else 0
+            year = r.get("year")
+            seniority = r.get("seniority")
+            vals = (
+                r.get("emp_id", ""),
+                r.get("name", ""),
+                "" if year in (None, "") else year,
+                "" if seniority in (None, "") else seniority,
+                "" if note else r.get("left_days", 0),
+                "" if note else left_h,
+                "" if note else r.get("granted_days", 0),
+                "" if note else r.get("used_days", 0),
+                _fmt_date(r.get("start_date", "")),
+                _fmt_date(r.get("end_date", "")),
+                note,
+            )
+            if r.get("error"):
+                tag = "err"
+            elif _soon(r.get("end_date", ""), r.get("left_days")):
+                tag = "soon"
+            else:
+                tag = ""
+            disp.append((vals, tag))
+
+        top = ctk.CTkToplevel(self)
+        top.title(f"特休餘額　共 {len(disp)} 列　查詢日 {today.isoformat()}")
+        top.geometry("1040x560")
+        top.configure(fg_color=_C["app_bg"])
+        top.transient(self)
+
+        ctk.CTkLabel(
+            top,
+            text="天數以每日 8 小時換算。底色:橘=90 天內到期且尚有餘額,紅=查詢失敗。",
+            text_color=_C["muted"], font=("", 12),
+        ).pack(anchor="w", padx=12, pady=(10, 0))
+
+        wrap = tk.Frame(top, bg=_C["app_bg"])
+        wrap.pack(fill="both", expand=True, padx=10, pady=(6, 0))
+
+        tv = ttk.Treeview(wrap, style="App.Treeview",
+                          columns=col_ids, show="headings", height=18)
+        for cid, (hdr, w) in zip(col_ids, _COLS):
+            tv.heading(cid, text=hdr)
+            anc = "w" if hdr in ("員工代號", "員工姓名", "備註") else "center"
+            tv.column(cid, width=w, anchor=anc, stretch=False)
+        tv.tag_configure("soon", background="#FFE8D6")
+        tv.tag_configure("err", background="#FBE0DC")
+        for vals, tag in disp:
+            tv.insert("", "end", values=vals, tags=(tag,) if tag else ())
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=vsb.set)
+        tv.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        def _export():
+            path = filedialog.asksaveasfilename(
+                defaultextension=".xlsx",
+                filetypes=[("Excel 活頁簿", "*.xlsx")],
+                initialfile=f"特休餘額_{today.isoformat()}.xlsx",
+                parent=top,
+            )
+            if not path:
+                return
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "特休餘額"
+            ws.append([h for h, _ in _COLS])
+            hdr_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2",
+                                   fill_type="solid")
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal="center")
+                cell.fill = hdr_fill
+            soon_fill = PatternFill(start_color="FFE8D6", end_color="FFE8D6",
+                                    fill_type="solid")
+            err_fill = PatternFill(start_color="FBE0DC", end_color="FBE0DC",
+                                   fill_type="solid")
+            for vals, tag in disp:
+                ws.append(list(vals))
+                fill = soon_fill if tag == "soon" else (
+                    err_fill if tag == "err" else None)
+                if fill:
+                    for cell in ws[ws.max_row]:
+                        cell.fill = fill
+            col_ws = [10, 12, 7, 10, 9, 9, 9, 9, 12, 12, 18]
+            for i, w in enumerate(col_ws, start=1):
+                ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+            for r in ws.iter_rows(min_row=2):
+                for cell in r:
+                    cell.alignment = Alignment(horizontal="center")
+                r[1].alignment = Alignment(horizontal="left")
+                r[10].alignment = Alignment(horizontal="left")
+            try:
+                wb.save(path)
+                messagebox.showinfo("完成", f"已匯出 {len(disp)} 列特休 → {path}",
                                     parent=top)
             except Exception as exc:
                 messagebox.showerror("匯出失敗", str(exc), parent=top)

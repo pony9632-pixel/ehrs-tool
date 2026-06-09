@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -365,6 +366,157 @@ class EhrsClient:
         return [
             {cols.get(k, k): v for k, v in row.items()} for row in rows
         ]
+
+    # ----- 特休餘額讀取 ----- #
+    #
+    # 文中沒有「特休額度」報表(WEBR3100 補休 / WEBR3120 彈性假 / WEBR3121 法定假
+    # 三張額度報表都不含特休,店長選單也沒有特休報表)。唯一拿得到「各員工特休
+    # 剩餘 + 到期日」的地方,是『請假單簽呈』(WEBF1010)選假別=特休後,按抵用
+    # 時數旁的「選擇」跳出的「特休假抵扣項目」清單。其端點:
+    #     Common/Webf1010AskForLeave/ResourceDeductionList
+    # 依 payload.wfl60.fl60002(員工代號)回傳「該員工」目前可用的各批特休額度,
+    # 換掉 fl60002 即可查任一員工(實測店長帳號可查同部門其他人,非只限本人)。
+    # 這是唯讀查詢,只是列出可抵扣額度,不會建立或送出任何請假單。
+    #
+    # 回傳結構:data.deductionData.deductions[] 每筆=一批特休額度,關鍵欄位
+    #   deductionLeaveName 假別(特休)   year 年度          seniority 年資
+    #   startDate 啟用日期               endDate 停用日期(=到期日)
+    #   deductionMinutes 給假時數(分)    usedMinutes 已用    leftMinutes 剩餘
+    # 時數單位為分鐘;天數 = 分鐘 / 每日時數(預設 480 = 8 小時)。fl60004=9 即特休。
+    _ANNUAL_LEAVE_ENDPOINT = "Common/Webf1010AskForLeave/ResourceDeductionList"
+
+    def get_annual_leave_balance(
+        self,
+        emp_id: str,
+        dept: str,
+        ref_date: Optional[DateLike] = None,
+        company: Optional[str] = None,
+        leave_type: int = 9,
+        day_minutes: int = 480,
+    ) -> list[dict]:
+        """查詢單一員工的特休(特別休假)各批額度:剩餘時數/天數 + 到期日。
+
+        ref_date 預設今天,決定「目前可用」的快照(已過停用日的批次不回傳)。
+        company 預設由 emp_id 的英文字首推得(如 'SA1588'→'SA')。
+        回傳 list,每批一個 dict:emp_id、year(年度)、seniority(年資)、
+        start_date(啟用)、end_date(停用=到期)、granted/used/left_minutes、
+        對應的 granted/used/left_days(= 分鐘 / day_minutes,四捨五入兩位)。
+        """
+        ref = _as_date(ref_date) if ref_date else _dt.date.today()
+        if company:
+            comp = company
+        else:
+            m = re.match(r"[A-Za-z]+", emp_id or "")
+            comp = m.group(0) if m else ""
+        day_iso = f"{ref.isoformat()}T00:00:00.000"
+        wfl60 = {
+            "pa51014": str(dept),
+            "fl60001": comp,
+            "fl60002": emp_id,
+            "fl60004": leave_type,
+            "fl60028Range": 1,
+            "fl60005": day_iso,
+            "fl60006": day_iso,
+            "fl60007Date": day_iso,
+            "fl60008Date": day_iso,
+            "fl60007Time": f"{ref.isoformat()}T09:00:00.000",
+            "fl60008Time": f"{ref.isoformat()}T18:00:00.000",
+        }
+        envelope = self._post_json(
+            self._ANNUAL_LEAVE_ENDPOINT, {"wfl60": wfl60, "sameEmpWfl60s": []}
+        )
+        data = (envelope or {}).get("data") or {}
+        deductions = (data.get("deductionData") or {}).get("deductions") or []
+        out: list[dict] = []
+        for row in deductions:
+            gm = row.get("deductionMinutes") or 0
+            um = row.get("usedMinutes") or 0
+            lm = row.get("leftMinutes") or 0
+            out.append(
+                {
+                    "emp_id": emp_id,
+                    "leave_name": row.get("deductionLeaveName") or "特休",
+                    "year": row.get("year"),
+                    "seniority": row.get("seniority"),
+                    "start_date": row.get("startDate") or "",
+                    "end_date": row.get("endDate") or "",
+                    "granted_minutes": gm,
+                    "used_minutes": um,
+                    "left_minutes": lm,
+                    "granted_days": round(gm / day_minutes, 2),
+                    "used_days": round(um / day_minutes, 2),
+                    "left_days": round(lm / day_minutes, 2),
+                    "raw": row,
+                }
+            )
+        return out
+
+    def get_annual_leave_balance_bulk(
+        self,
+        employees: list[dict],
+        ref_date: Optional[DateLike] = None,
+        leave_type: int = 9,
+        day_minutes: int = 480,
+        progress_cb=None,        # Callable[[done: int, total: int], None]
+        max_workers: int = 6,
+    ) -> list[dict]:
+        """批次查詢多位員工特休餘額。employees 每筆需含 emp_id、dept,可選 name。
+
+        回傳攤平的清單,且「每位員工至少一列」:有額度者每批一列;查無額度者一列
+        (note='（無特休額度）');查詢失敗者一列(error=訊息)。順序同 employees 輸入,
+        同一員工的多批依 API 回傳序。progress_cb(done, total) 每處理完一位呼叫一次。
+        注意:eHRS 同一 session 多半被 ASP.NET session 鎖序列化,調高 workers 幫助有限。
+        """
+        results: list[Optional[list[dict]]] = [None] * len(employees)
+        done = [0]
+        lock = threading.Lock()
+
+        def _blank(eid: str, name: str, **extra) -> dict:
+            base = {
+                "emp_id": eid, "name": name, "leave_name": "特休",
+                "year": None, "seniority": None, "start_date": "", "end_date": "",
+                "granted_minutes": 0, "used_minutes": 0, "left_minutes": 0,
+                "granted_days": 0, "used_days": 0, "left_days": 0,
+            }
+            base.update(extra)
+            return base
+
+        def _tick() -> None:
+            if progress_cb:
+                with lock:
+                    done[0] += 1
+                    n = done[0]
+                progress_cb(n, len(employees))
+
+        def _one(idx: int, emp: dict) -> None:
+            eid = emp.get("emp_id") or ""
+            name = emp.get("name") or ""
+            dept = emp.get("dept") or ""
+            try:
+                batches = self.get_annual_leave_balance(
+                    eid, dept, ref_date=ref_date,
+                    leave_type=leave_type, day_minutes=day_minutes,
+                )
+                if batches:
+                    for b in batches:
+                        b["name"] = name
+                    results[idx] = batches
+                else:
+                    results[idx] = [_blank(eid, name, note="（無特休額度）")]
+            except EhrsError as exc:
+                results[idx] = [_blank(eid, name, error=str(exc))]
+            _tick()
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_one, i, e) for i, e in enumerate(employees)]
+            for f in as_completed(futures):
+                f.result()
+
+        flat: list[dict] = []
+        for sub in results:
+            if sub:
+                flat.extend(sub)
+        return flat
 
     # ----- 排班寫入(建立 / 修改 / 刪除) ----- #
     #
