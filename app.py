@@ -406,22 +406,30 @@ def _bind_mousewheel(widget, target=None) -> None:
             _WHEEL_ACTIVE_TARGET = None
             _WHEEL_ACTIVE_WIDGET = None
 
+    def _safe_bind(seq: str, callback, *, bind_all: bool = False) -> None:
+        try:
+            if bind_all:
+                widget.bind_all(seq, callback, add="+")
+            else:
+                widget.bind(seq, callback)
+        except tk.TclError:
+            # 部分 Tk build 不支援 Button-6/7；略過即可，垂直捲動仍可用。
+            pass
+
     if not _WHEEL_BOUND:
-        widget.bind_all("<MouseWheel>", _global_handler, add="+")
-        widget.bind_all("<Shift-MouseWheel>", _global_handler, add="+")
-        widget.bind_all("<Button-4>", _global_handler, add="+")
-        widget.bind_all("<Button-5>", _global_handler, add="+")
-        widget.bind_all("<Button-6>", _global_handler, add="+")
-        widget.bind_all("<Button-7>", _global_handler, add="+")
+        for seq in (
+            "<MouseWheel>", "<Shift-MouseWheel>",
+            "<Button-4>", "<Button-5>", "<Button-6>", "<Button-7>",
+        ):
+            _safe_bind(seq, _global_handler, bind_all=True)
         _WHEEL_BOUND = True
 
     # 直接綁在 widget 上作為後備（事件確實送達時即可用）
-    widget.bind("<MouseWheel>", _handler)
-    widget.bind("<Shift-MouseWheel>", _handler)
-    widget.bind("<Button-4>", _handler)
-    widget.bind("<Button-5>", _handler)
-    widget.bind("<Button-6>", _handler)
-    widget.bind("<Button-7>", _handler)
+    for seq in (
+        "<MouseWheel>", "<Shift-MouseWheel>",
+        "<Button-4>", "<Button-5>", "<Button-6>", "<Button-7>",
+    ):
+        _safe_bind(seq, _handler)
     # 指標進入/離開時切換 app 層級綁定，涵蓋事件未直接送達 widget 的情況
     widget.bind("<Enter>", _on_enter)
     widget.bind("<Leave>", _on_leave)
