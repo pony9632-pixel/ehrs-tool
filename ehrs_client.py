@@ -16,6 +16,7 @@
     pa51014  部門代號        pa51014Name 部門名稱
     pa51135  職稱代號        pa51135Name 職稱名稱
     pa51020  預設班別代號    pa51011  員工現況(1=在職,2=離職)
+    pa51024  到職日期(ISO,如 2017-06-01T00:00:00;get_schedule 的 emp 物件即帶)
     pa51018  刷卡類別(1=免刷卡,2=刷卡人員)
   排班 (PB29/WPB29 排班檔)
     pb29001  公司別          pb29002  排班日期
@@ -127,6 +128,7 @@ class EmployeeSchedule:
     rest_days: int
     shifts: list[Shift]
     raw: dict = field(repr=False, default_factory=dict)
+    hire_date: str = ""  # pa51024 到職日期 (ISO 字串; 可能為空)
 
     def shift_on(self, date: DateLike) -> Optional[Shift]:
         target = _as_date(date).isoformat()
@@ -270,6 +272,7 @@ class EhrsClient:
                     rest_days=emp.get("restDays", 0),
                     shifts=shifts,
                     raw=emp,
+                    hire_date=emp.get("pa51024", "") or "",
                 )
             )
         return result

@@ -692,6 +692,11 @@ class EhrsApp(ctk.CTk):
             fg_color=_C["accent"], hover_color=_C["acc_h"],
             corner_radius=8, command=self._show_annual_leave
             ).pack(side="right", padx=(4, 0), pady=6)
+        ctk.CTkButton(
+            bar, text="到職日", width=90,
+            fg_color=_C["tab_bg"], text_color=_C["ink"], hover_color=_C["line"],
+            corner_radius=8, command=self._show_staff_info
+            ).pack(side="right", padx=(4, 0), pady=6)
 
         # ── 排班格 ───────────────────────────────────────────
         wrap = tk.Frame(tab, bg=_C["app_bg"])
@@ -1910,6 +1915,112 @@ class EhrsApp(ctk.CTk):
             try:
                 wb.save(path)
                 messagebox.showinfo("完成", f"已匯出 {len(disp)} 列特休 → {path}",
+                                    parent=top)
+            except Exception as exc:
+                messagebox.showerror("匯出失敗", str(exc), parent=top)
+
+        ctk.CTkButton(top, text="匯出 Excel", width=120,
+                       fg_color=_C["muted"], hover_color="#6B7280",
+                       corner_radius=8, command=_export).pack(pady=8)
+
+    # -------------------------------------------------------------- 到職日
+    def _show_staff_info(self) -> None:
+        """彈窗顯示夥伴(員工)的到職日與年資。資料來自已載入的排班，免再連線。"""
+        if not self.schedule:
+            messagebox.showinfo("尚未載入", "請先按「載入排班」載入員工後再查到職日。")
+            return
+
+        today = dt.date.today()
+
+        def _fmt_date(s) -> str:
+            s = str(s or "").strip()
+            return s[:10] if len(s) >= 10 else s
+
+        def _seniority(hire_iso: str) -> str:
+            try:
+                hd = dt.date.fromisoformat(_fmt_date(hire_iso))
+            except ValueError:
+                return ""
+            months = (today.year - hd.year) * 12 + (today.month - hd.month)
+            if today.day < hd.day:
+                months -= 1
+            if months < 0:
+                return ""
+            return f"{months // 12}年{months % 12}月"
+
+        rows = []
+        for e in self.schedule:
+            if self._sched_emp_filter and e.emp_id not in self._sched_emp_filter:
+                continue
+            hire = _fmt_date(getattr(e, "hire_date", "") or e.raw.get("pa51024", ""))
+            rows.append((e.emp_id, e.name, e.title or "", hire, _seniority(hire)))
+        if not rows:
+            messagebox.showinfo("無員工", "目前篩選後沒有員工可顯示。")
+            return
+        # 依到職日排序(資深在前);無到職日者排最後
+        rows.sort(key=lambda r: (r[3] == "", r[3]))
+
+        _COLS = [("員工代號", 90), ("員工姓名", 110), ("職稱", 150),
+                 ("到職日", 110), ("年資", 90)]
+        col_ids = [f"c{i}" for i in range(len(_COLS))]
+
+        top = ctk.CTkToplevel(self)
+        top.title(f"夥伴到職日　共 {len(rows)} 人")
+        top.geometry("620x520")
+        top.configure(fg_color=_C["app_bg"])
+        top.transient(self)
+
+        ctk.CTkLabel(top, text="依到職日排序（資深在前）。年資為到今日的概算。",
+                     text_color=_C["muted"], font=("", 12)).pack(
+            anchor="w", padx=12, pady=(10, 0))
+
+        wrap = tk.Frame(top, bg=_C["app_bg"])
+        wrap.pack(fill="both", expand=True, padx=10, pady=(6, 0))
+        tv = ttk.Treeview(wrap, style="App.Treeview",
+                          columns=col_ids, show="headings", height=18)
+        for cid, (hdr, w) in zip(col_ids, _COLS):
+            tv.heading(cid, text=hdr)
+            anc = "center" if hdr in ("到職日", "年資") else "w"
+            tv.column(cid, width=w, anchor=anc, stretch=False)
+        for row in rows:
+            tv.insert("", "end", values=row)
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=vsb.set)
+        tv.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        def _export():
+            path = filedialog.asksaveasfilename(
+                defaultextension=".xlsx",
+                filetypes=[("Excel 活頁簿", "*.xlsx")],
+                initialfile=f"夥伴到職日_{today.isoformat()}.xlsx",
+                parent=top,
+            )
+            if not path:
+                return
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "到職日"
+            ws.append([h for h, _ in _COLS])
+            hdr_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2",
+                                   fill_type="solid")
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal="center")
+                cell.fill = hdr_fill
+            for row in rows:
+                ws.append(list(row))
+            col_ws = [12, 14, 20, 14, 10]
+            for i, w in enumerate(col_ws, start=1):
+                ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+            for r in ws.iter_rows(min_row=2):
+                for cell in r:
+                    cell.alignment = Alignment(horizontal="center")
+                for idx in (0, 1, 2):
+                    r[idx].alignment = Alignment(horizontal="left")
+            try:
+                wb.save(path)
+                messagebox.showinfo("完成", f"已匯出 {len(rows)} 人到職日 → {path}",
                                     parent=top)
             except Exception as exc:
                 messagebox.showerror("匯出失敗", str(exc), parent=top)
