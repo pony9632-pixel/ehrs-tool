@@ -128,7 +128,7 @@ class EmployeeSchedule:
     rest_days: int
     shifts: list[Shift]
     raw: dict = field(repr=False, default_factory=dict)
-    hire_date: str = ""  # pa51024 到職日期 (ISO 字串; 可能為空)
+    hire_date: str = ""  # pa51024 到職日期(ISO 字串;可能為空)
 
     def shift_on(self, date: DateLike) -> Optional[Shift]:
         target = _as_date(date).isoformat()
@@ -377,15 +377,8 @@ class EhrsClient:
     # 剩餘 + 到期日」的地方,是『請假單簽呈』(WEBF1010)選假別=特休後,按抵用
     # 時數旁的「選擇」跳出的「特休假抵扣項目」清單。其端點:
     #     Common/Webf1010AskForLeave/ResourceDeductionList
-    # 依 payload.wfl60.fl60002(員工代號)回傳「該員工」目前可用的各批特休額度,
-    # 換掉 fl60002 即可查任一員工(實測店長帳號可查同部門其他人,非只限本人)。
+    # 依 payload.wfl60.fl60002(員工代號)回傳「該員工」目前可用的各批特休額度。
     # 這是唯讀查詢,只是列出可抵扣額度,不會建立或送出任何請假單。
-    #
-    # 回傳結構:data.deductionData.deductions[] 每筆=一批特休額度,關鍵欄位
-    #   deductionLeaveName 假別(特休)   year 年度          seniority 年資
-    #   startDate 啟用日期               endDate 停用日期(=到期日)
-    #   deductionMinutes 給假時數(分)    usedMinutes 已用    leftMinutes 剩餘
-    # 時數單位為分鐘;天數 = 分鐘 / 每日時數(預設 480 = 8 小時)。fl60004=9 即特休。
     _ANNUAL_LEAVE_ENDPOINT = "Common/Webf1010AskForLeave/ResourceDeductionList"
 
     def get_annual_leave_balance(
@@ -397,14 +390,7 @@ class EhrsClient:
         leave_type: int = 9,
         day_minutes: int = 480,
     ) -> list[dict]:
-        """查詢單一員工的特休(特別休假)各批額度:剩餘時數/天數 + 到期日。
-
-        ref_date 預設今天,決定「目前可用」的快照(已過停用日的批次不回傳)。
-        company 預設由 emp_id 的英文字首推得(如 'SA1588'→'SA')。
-        回傳 list,每批一個 dict:emp_id、year(年度)、seniority(年資)、
-        start_date(啟用)、end_date(停用=到期)、granted/used/left_minutes、
-        對應的 granted/used/left_days(= 分鐘 / day_minutes,四捨五入兩位)。
-        """
+        """查詢單一員工的特休各批額度:剩餘時數/天數 + 到期日。"""
         ref = _as_date(ref_date) if ref_date else _dt.date.today()
         if company:
             comp = company
@@ -460,16 +446,10 @@ class EhrsClient:
         ref_date: Optional[DateLike] = None,
         leave_type: int = 9,
         day_minutes: int = 480,
-        progress_cb=None,        # Callable[[done: int, total: int], None]
+        progress_cb=None,
         max_workers: int = 6,
     ) -> list[dict]:
-        """批次查詢多位員工特休餘額。employees 每筆需含 emp_id、dept,可選 name。
-
-        回傳攤平的清單,且「每位員工至少一列」:有額度者每批一列;查無額度者一列
-        (note='（無特休額度）');查詢失敗者一列(error=訊息)。順序同 employees 輸入,
-        同一員工的多批依 API 回傳序。progress_cb(done, total) 每處理完一位呼叫一次。
-        注意:eHRS 同一 session 多半被 ASP.NET session 鎖序列化,調高 workers 幫助有限。
-        """
+        """批次查詢多位員工特休餘額。employees 每筆需含 emp_id、dept,可選 name。"""
         results: list[Optional[list[dict]]] = [None] * len(employees)
         done = [0]
         lock = threading.Lock()
@@ -804,6 +784,20 @@ class EhrsClient:
                     return filt, cal
             return None, None
 
+        # 預先為每個 calendar 建 code -> kind 對照(只掃一次),取代每筆變更
+        # 重掃整包 calendar 的 _kind_from_calendar。執行緒內僅讀取,故安全。
+        kind_maps: dict[int, dict[str, int]] = {}
+        for _filt, _cal in cals:
+            cmap: dict[str, int] = {}
+            for emp in _cal.get("shiftEmployees", []):
+                for cell in emp.get("cells", []):
+                    for s in (cell.get("schedules") or []):
+                        c = s.get("pb29005")
+                        k = s.get("pb29004")
+                        if c and k is not None and c not in cmap:
+                            cmap[c] = k
+            kind_maps[id(_cal)] = cmap
+
         total = len(changes)
         results: list[dict | None] = [None] * total
         done_count = [0]
@@ -819,7 +813,7 @@ class EhrsClient:
                                 "error": f"找不到員工 {emp_id}(請確認該員工在此期間班表內)"}
                 _tick()
                 return
-            kind = ch.get("kind") or self._kind_from_calendar(calendar, shift_code)
+            kind = ch.get("kind") or kind_maps.get(id(calendar), {}).get(shift_code, 3)
             try:
                 payload = self._build_shift_payload(
                     calendar, filt, emp_id, date, shift_code, kind

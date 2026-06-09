@@ -12,6 +12,8 @@ import datetime as dt
 import re
 import threading
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from itertools import groupby
 from tkinter import messagebox, ttk
 
@@ -48,12 +50,29 @@ _C = {
 
 _WEEK = "一二三四五六日"
 _EXCEL_SHEET_BAD_CHARS = re.compile(r"[\[\]\*\?/\\:]")
+_DEPT_KEYS = ("部門名稱", "部門", "部門全名", "pa51014FullName", "pa51014Name")
+_DEPT_CODE_KEYS = ("部門代號", "pa51014")
+_DEPT_FULL_KEYS = ("部門全名", "pa51014FullName")
+_DEPT_NAME_KEYS = ("部門名稱", "部門", "pa51014Name")
+_EMP_ID_KEYS = ("員工代號", "pa51002")
+_EMP_NAME_KEYS = ("員工姓名", "pa51004")
+_W_BTN = 86
+_W_FILTER = 112
+_W_PRIMARY = 124
 
 
 def _excel_sheet_title(title: str) -> str:
     """Return a valid Excel worksheet title."""
     cleaned = _EXCEL_SHEET_BAD_CHARS.sub("-", title).strip().strip("'")
     return (cleaned or "Sheet")[:31]
+
+
+def _first_field(row: dict, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
 
 
 def _get_schedule_periods(roc_year: int) -> list[tuple[dt.date, dt.date]]:
@@ -78,13 +97,16 @@ def _is_rest(code: str) -> bool:
     return bool(code) and code.startswith("991")
 
 
+@lru_cache(maxsize=None)
 def _shift_times(code: str) -> tuple[str, str]:
-    """從 SHIFT_CODES_REF 解析班別的表定上班/下班時間（HH:MM）。"""
+    """從 SHIFT_CODES_REF 解析班別的表定上班/下班時間（HH:MM）。
+    SHIFT_CODES_REF 為唯讀常數,輸入班別代碼有限,故以 lru_cache 快取(熱路徑)。"""
     name = SHIFT_CODES_REF.get(code, ("", 3, 0.0))[0]
     m = re.search(r"(\d{2}:\d{2})-(\d{2}:\d{2})", name)
     return (m.group(1), m.group(2)) if m else ("", "")
 
 
+@lru_cache(maxsize=None)
 def _shift_hours(code: str) -> float:
     """從 SHIFT_CODES_REF 直接取得班別時數（已含休息扣除）。"""
     return SHIFT_CODES_REF.get(code, ("", 3, 0.0))[2]
@@ -133,6 +155,35 @@ def _split_punches_jiezhuan(punches: list[str], sched_in: str, sched_out: str) -
     return (in_grp[0] if in_grp else ""), (out_grp[-1] if out_grp else "")
 
 
+def _overtime_hours(clock_in: str, clock_out: str, sched_in: str, sched_out: str,
+                    kind: int | None = None) -> float:
+    """加班 / 休息日加班時數(四捨五入至 0.5h);無加班回 0.0。
+    為「備注字串」與「出勤統計」共用的單一計算來源(避免從字串反解)。"""
+    # 休息日(kind=2):工作全程即加班
+    if kind == 2:
+        if not (clock_in and clock_out and sched_in and sched_out):
+            return 0.0
+        ci = _punch_mins(clock_in)
+        co = _punch_mins(clock_out)
+        if co < ci:
+            co += 1440   # 跨夜
+        worked = co - ci
+        return round(worked / 60 * 2) / 2 if worked > 0 else 0.0
+    # 一般工作日:下班超過表定 30 分才算加班(以打卡下班為準)
+    if not (clock_out and sched_in and sched_out):
+        return 0.0
+    si = _punch_mins(sched_in)
+    so = _punch_mins(sched_out)
+    co = _punch_mins(clock_out)
+    if so < si:
+        so += 1440
+    if co < si - 120:
+        co += 1440
+    if co > so + 30:
+        return round((co - so) / 60 * 2) / 2
+    return 0.0
+
+
 def _punch_remark(clock_in: str, clock_out: str, sched_in: str, sched_out: str,
                   kind: int | None = None) -> str:
     """產生備注文字：遲到、早退、上班忘打卡、下班忘打卡、加班（可複合）。
@@ -142,15 +193,9 @@ def _punch_remark(clock_in: str, clock_out: str, sched_in: str, sched_out: str,
 
     # ── 休息日（kind=2）：只要有打卡就是加班 ──────────────────────
     if kind == 2:
-        if clock_in and clock_out and sched_in and sched_out:
-            ci = _punch_mins(clock_in)
-            co = _punch_mins(clock_out)
-            si = _punch_mins(sched_in)
-            if co < ci: co += 1440   # 跨夜
-            worked_min = co - ci
-            if worked_min > 0:
-                h = round(worked_min / 60 * 2) / 2   # 四捨五入至 0.5h
-                remarks.append(f"休息日加班{h:g}h")
+        oh = _overtime_hours(clock_in, clock_out, sched_in, sched_out, kind=2)
+        if oh > 0:
+            remarks.append(f"休息日加班{oh:g}h")
         elif clock_in:
             remarks.append("休息日加班")
         return " ".join(remarks)
@@ -173,9 +218,27 @@ def _punch_remark(clock_in: str, clock_out: str, sched_in: str, sched_out: str,
         if co < so:
             remarks.append("早退")
         elif co > so + 30:                           # 超過 30 分鐘算加班
-            extra_h = round((co - so) / 60 * 2) / 2
-            remarks.append(f"加班{extra_h:g}h")
+            oh = _overtime_hours(clock_in, clock_out, sched_in, sched_out, kind=kind)
+            remarks.append(f"加班{oh:g}h")
     return " ".join(remarks)
+
+
+# 備注分類所用關鍵字(集中一處,供 _classify_remark 與各分頁共用)
+_REMARK_ERR_KEYWORDS = ("遲到", "上班忘打卡", "早退", "下班忘打卡", "曠職")
+_REMARK_OT_KEYWORD = "加班"   # 含「加班」「休息日加班」
+
+
+def _classify_remark(remark: str) -> str:
+    """把備注歸成單一類別:'err'(異常) / 'ot'(加班) / 'leave'(假別) / ''(正常)。
+    優先序 err > ot > leave。打卡分頁著色、篩選、統計、建議共用此判斷。"""
+    remark = remark or ""
+    if not remark:
+        return ""
+    if any(k in remark for k in _REMARK_ERR_KEYWORDS):
+        return "err"
+    if _REMARK_OT_KEYWORD in remark:
+        return "ot"
+    return "leave"
 
 
 def _calc_hours(sched_in: str, sched_out: str) -> float:
@@ -247,6 +310,131 @@ def _assign_single_punch(punch: str, sched_in: str, sched_out: str) -> tuple[str
             p += 1440
         return ("", punch) if abs(p - so) <= abs(p - si) else (punch, "")
     return ("", punch) if sched_out else (punch, "")
+
+
+_WHEEL_ACTIVE_TARGET = None
+_WHEEL_ACTIVE_WIDGET = None
+_WHEEL_BOUND = False
+
+
+def _wheel_units(event) -> int:
+    """把滾輪 / 觸控板事件換算成 yview_scroll 的 units（負值=往上）。
+    跨平台：
+      - macOS：delta 為小整數（±1、±2…），直接當單位數，不可除以 120/60。
+      - Windows：delta 為 ±120 的倍數。
+      - Linux/X11：無 delta，改用 Button-4（上）/ Button-5（下）。"""
+    d = getattr(event, "delta", 0)
+    if d:
+        if abs(d) >= 120:                       # Windows / 部分 X11
+            return int(-d / 120) or (-1 if d > 0 else 1)
+        return -d                                # macOS：delta 已是單位數
+    num = getattr(event, "num", 0)
+    if num == 4:
+        return -1
+    if num == 5:
+        return 1
+    if num == 6:
+        return -1
+    if num == 7:
+        return 1
+    return 0
+
+
+def _wheel_axis(event) -> str:
+    """判斷滾輪事件要導向垂直或水平捲動。"""
+    num = getattr(event, "num", 0)
+    if num in (6, 7):
+        return "x"
+    # Tk 在多數平台把水平滾輪/觸控板事件映射成 Shift-MouseWheel。
+    if getattr(event, "state", 0) & 0x0001:
+        return "x"
+    return "y"
+
+
+def _scroll_target(target, event) -> bool:
+    n = _wheel_units(event)
+    if not n:
+        return False
+    axis = _wheel_axis(event)
+    try:
+        if axis == "x" and hasattr(target, "xview_scroll"):
+            target.xview_scroll(n, "units")
+        elif axis == "x" and hasattr(target, "xview"):
+            target.xview("scroll", n, "units")
+        elif hasattr(target, "yview_scroll"):
+            target.yview_scroll(n, "units")
+        else:
+            target.yview("scroll", n, "units")
+    except Exception:
+        return False
+    return True
+
+
+def _bind_mousewheel(widget, target=None) -> None:
+    """讓 widget 區域內的上下滾輪/觸控板捲動 target（預設為 widget 本身）。
+
+    為何用全域 active target 而非每個 widget 都 bind_all / unbind_all：
+    在 macOS + CustomTkinter 的巢狀版面中，滾輪事件不一定會送達被捲動的
+    那個 widget（可能落到外層 CTk frame），導致只有少數頁面能捲。改採
+    「全域只綁一次，指標進入時切換目前 target」的做法，避免離開某個表格時
+    unbind_all 清掉 CustomTkinter 自己的觸控板捲動綁定。
+    跨平台：macOS delta 為小整數、Windows 為 ±120 倍數、Linux 用 Button-4/5。
+    也支援 Shift/水平滾輪導向 xview_scroll。"""
+    global _WHEEL_BOUND
+    tgt = target if target is not None else widget
+
+    def _handler(event):
+        if _scroll_target(tgt, event):
+            return "break"
+        return None
+
+    def _global_handler(event):
+        if _WHEEL_ACTIVE_TARGET is None:
+            return None
+        if _scroll_target(_WHEEL_ACTIVE_TARGET, event):
+            return "break"
+        return None
+
+    def _on_enter(_e):
+        global _WHEEL_ACTIVE_TARGET, _WHEEL_ACTIVE_WIDGET
+        _WHEEL_ACTIVE_TARGET = tgt
+        _WHEEL_ACTIVE_WIDGET = widget
+
+    def _on_leave(_e):
+        global _WHEEL_ACTIVE_TARGET, _WHEEL_ACTIVE_WIDGET
+        if _WHEEL_ACTIVE_WIDGET is widget:
+            _WHEEL_ACTIVE_TARGET = None
+            _WHEEL_ACTIVE_WIDGET = None
+
+    if not _WHEEL_BOUND:
+        widget.bind_all("<MouseWheel>", _global_handler, add="+")
+        widget.bind_all("<Shift-MouseWheel>", _global_handler, add="+")
+        widget.bind_all("<Button-4>", _global_handler, add="+")
+        widget.bind_all("<Button-5>", _global_handler, add="+")
+        widget.bind_all("<Button-6>", _global_handler, add="+")
+        widget.bind_all("<Button-7>", _global_handler, add="+")
+        _WHEEL_BOUND = True
+
+    # 直接綁在 widget 上作為後備（事件確實送達時即可用）
+    widget.bind("<MouseWheel>", _handler)
+    widget.bind("<Shift-MouseWheel>", _handler)
+    widget.bind("<Button-4>", _handler)
+    widget.bind("<Button-5>", _handler)
+    widget.bind("<Button-6>", _handler)
+    widget.bind("<Button-7>", _handler)
+    # 指標進入/離開時切換 app 層級綁定，涵蓋事件未直接送達 widget 的情況
+    widget.bind("<Enter>", _on_enter)
+    widget.bind("<Leave>", _on_leave)
+
+
+def _bind_scrollable_frame_mousewheel(scrollable) -> None:
+    """補強 CTkScrollableFrame 的觸控板/滾輪事件，不覆蓋 CTk 內建綁定。"""
+    target = (
+        getattr(scrollable, "_parent_canvas", None)
+        or getattr(scrollable, "_canvas", None)
+        or scrollable
+    )
+    _bind_mousewheel(scrollable, target=target)
 
 
 class _ScheduleHeader(tk.Canvas):
@@ -347,12 +535,13 @@ class _ScheduleGrid(tk.Frame):
         self._dates: list = []
 
         self._cv = tk.Canvas(self, bg="#FFFFFF", highlightthickness=0)
+        # 設定捲動單位=列高,讓滾輪/觸控板一格捲一列(預設 0 會導致幾乎不動)
+        self._cv.configure(yscrollincrement=self.ROW_H)
         self._cv.grid(row=0, column=0, sticky="nsew")
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
 
-        self._cv.bind("<MouseWheel>",
-                      lambda e: self._cv.yview_scroll(int(-1 * e.delta / 60), "units"))
+        _bind_mousewheel(self._cv)
         self._cv.bind("<Double-Button-1>", self._handle_double)
 
     # ── 對外 scroll API（接替 ttk.Treeview） ──────────────────────────────
@@ -463,6 +652,8 @@ class _PunchTable(tk.Frame):
         super().__init__(parent, **kw)
         self._data: list[tuple] = []
         self._cv = tk.Canvas(self, bg="#FFFFFF", highlightthickness=0)
+        # 設定捲動單位=列高,讓滾輪/觸控板一格捲一列(預設 0 會導致幾乎不動)
+        self._cv.configure(yscrollincrement=self.ROW_H)
         vsb = ttk.Scrollbar(self, orient="vertical",   command=self._cv.yview)
         hsb = ttk.Scrollbar(self, orient="horizontal", command=self._cv.xview)
         self._cv.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -471,8 +662,7 @@ class _PunchTable(tk.Frame):
         hsb.grid(row=1, column=0, sticky="ew")
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
-        self._cv.bind("<MouseWheel>",
-                      lambda e: self._cv.yview_scroll(int(-1 * e.delta / 60), "units"))
+        _bind_mousewheel(self._cv)
         self._tw = sum(w for _, w in self.COLS)
         self._draw_header()
 
@@ -510,6 +700,119 @@ class _PunchTable(tk.Frame):
         return [v for v, _ in self._data]
 
 
+class _SuggestionTable(tk.Frame):
+    """High-density suggestion list with row selection and quick apply."""
+
+    COLS = [
+        ("status", "狀態", 58, "center"),
+        ("type", "類型", 70, "center"),
+        ("date", "日期", 92, "center"),
+        ("emp", "員工", 120, "w"),
+        ("current", "原班別", 72, "center"),
+        ("scheduled", "表定", 92, "center"),
+        ("actual", "實際", 92, "center"),
+        ("delta", "差異", 92, "center"),
+        ("best", "最佳建議", 130, "w"),
+        ("hours", "工時", 52, "center"),
+        ("action", "套用", 74, "center"),
+    ]
+
+    def __init__(self, parent, on_select=None, on_apply=None, **kw):
+        super().__init__(parent, **kw)
+        self._rows: dict[str, dict] = {}
+        self._on_select = on_select
+        self._on_apply = on_apply
+        cols = [c[0] for c in self.COLS]
+        self.tv = ttk.Treeview(
+            self, style="App.Treeview", columns=cols, show="headings",
+            selectmode="browse", height=18
+        )
+        for key, label, width, anchor in self.COLS:
+            self.tv.heading(key, text=label)
+            self.tv.column(key, width=width, anchor=anchor, stretch=False)
+        ysb = ttk.Scrollbar(self, orient="vertical", command=self.tv.yview)
+        xsb = ttk.Scrollbar(self, orient="horizontal", command=self.tv.xview)
+        self.tv.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self.tv.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew")
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        _bind_mousewheel(self.tv)
+        self.tv.tag_configure("applied", foreground=_C["green"])
+        self.tv.tag_configure("failed", foreground=_C["red"])
+        self.tv.tag_configure("empty", foreground=_C["muted"])
+        self.tv.bind("<<TreeviewSelect>>", self._handle_select)
+        self.tv.bind("<ButtonRelease-1>", self._handle_click)
+
+    def populate(self, rows: list[dict]) -> None:
+        self._rows = {r["id"]: r for r in rows}
+        self.tv.delete(*self.tv.get_children())
+        for row in rows:
+            tags = []
+            if row.get("status") == "已套用":
+                tags.append("applied")
+            elif row.get("status") == "失敗":
+                tags.append("failed")
+            elif not row.get("best_candidate"):
+                tags.append("empty")
+            self.tv.insert("", "end", iid=row["id"], values=self._values(row),
+                           tags=tuple(tags))
+
+    def select(self, row_id: str | None) -> None:
+        if row_id and row_id in self._rows:
+            self.tv.selection_set(row_id)
+            self.tv.focus(row_id)
+            self.tv.see(row_id)
+            if self._on_select:
+                self._on_select(self._rows[row_id])
+
+    def first_id(self) -> str | None:
+        children = self.tv.get_children()
+        return children[0] if children else None
+
+    def _values(self, row: dict) -> tuple:
+        best = row.get("best_candidate")
+        best_txt = "無合適建議"
+        hours = ""
+        action = ""
+        if best:
+            code, si, so, _d_in, _d_out, h = best
+            name = row.get("shift_names", {}).get(code, "")
+            best_txt = f"{code} {name or f'{si}-{so}'}".strip()
+            hours = f"{h:g}h"
+            action = "" if row.get("status") in ("已套用", "套用中") else "套用最佳"
+        return (
+            row.get("status", "待處理"),
+            row.get("type", ""),
+            row.get("date", ""),
+            f"{row.get('emp_id', '')} {row.get('name', '')}".strip(),
+            row.get("current_shift", ""),
+            row.get("scheduled", ""),
+            row.get("actual", ""),
+            row.get("delta", ""),
+            best_txt,
+            hours,
+            action,
+        )
+
+    def _handle_select(self, _event=None) -> None:
+        sel = self.tv.selection()
+        if sel and self._on_select:
+            self._on_select(self._rows.get(sel[0]))
+
+    def _handle_click(self, event) -> None:
+        iid = self.tv.identify_row(event.y)
+        col = self.tv.identify_column(event.x)
+        if not iid or col != f"#{len(self.COLS)}":
+            return
+        row = self._rows.get(iid)
+        if (row and row.get("best_candidate")
+                and row.get("status") not in ("已套用", "套用中")):
+            if self._on_apply:
+                self._on_apply(iid)
+
+
 class EhrsApp(ctk.CTk):
     def __init__(self, auto_login: bool = True) -> None:
         super().__init__()
@@ -524,6 +827,11 @@ class EhrsApp(ctk.CTk):
         self.shift_codes: dict[str, tuple[str, int]] = dict(SHIFT_CODES_REF)
         self._punch_cache: list[tuple] = []
         self._raw_punch_rows: list[dict] = []   # 原始刷卡紀錄（每刷一筆一列）
+        self._raw_punch_range: tuple | None = None   # 上次打卡查詢的 (start_iso, end_iso)
+        self._selected_emps: set[str] = set()    # 全域篩選：empty = 全員
+        self._selected_depts: set[str] = set()   # 全域篩選：empty = 全部門
+        self._emp_dept: dict[str, str] = {}      # emp_id -> 部門名稱
+        self._emp_dept_code: dict[str, str] = {} # emp_id -> 部門代號
 
         self._build_ui()
         if auto_login:
@@ -636,24 +944,24 @@ class EhrsApp(ctk.CTk):
         self._period_start: dt.date | None = None
         self._period_end:   dt.date | None = None
         self._grid_dates:   list[dt.date]  = []
-        # 主畫面常駐員工篩選；空集合代表「全部員工」(不篩選)
-        self._sched_emp_filter: set[str] = set()
+        # 排班頁部門對照；篩選狀態使用全域 _selected_depts/_selected_emps
+        self._sched_emp_dept: dict[str, str] = {}
 
         # ── 民國年 ──────────────────────────────────────────
         ctk.CTkLabel(bar, text="民國", text_color=_C["ink"],
-                      font=("", 13)).pack(side="left", padx=(12, 2), pady=6)
+                      font=("", 13)).pack(side="left", padx=(8, 2), pady=5)
         self.roc_year_var = ctk.StringVar(value=str(now.year - 1911))
-        roc_ent = ctk.CTkEntry(bar, textvariable=self.roc_year_var, width=54,
+        roc_ent = ctk.CTkEntry(bar, textvariable=self.roc_year_var, width=48,
                                 border_color=_C["line"], fg_color=_C["white"],
                                 text_color=_C["ink"])
-        roc_ent.pack(side="left", pady=6)
+        roc_ent.pack(side="left", pady=5)
         ctk.CTkLabel(bar, text="年", text_color=_C["ink"],
-                      font=("", 13)).pack(side="left", padx=(2, 8))
+                      font=("", 13)).pack(side="left", padx=(2, 6))
 
         # ── 排班期間下拉 ─────────────────────────────────────
         self.period_var  = ctk.StringVar()
         self.period_menu = ctk.CTkOptionMenu(
-            bar, variable=self.period_var, width=200,
+            bar, variable=self.period_var, width=156,
             fg_color=_C["white"], button_color=_C["accent"],
             button_hover_color=_C["acc_h"],
             dropdown_fg_color=_C["white"],
@@ -661,42 +969,46 @@ class EhrsApp(ctk.CTk):
             text_color=_C["ink"], dropdown_text_color=_C["ink"],
             command=self._on_period_select,
         )
-        self.period_menu.pack(side="left", pady=6)
+        self.period_menu.pack(side="left", pady=5)
         roc_ent.bind("<Return>",   lambda e: self._refresh_period_menu())
         roc_ent.bind("<FocusOut>", lambda e: self._refresh_period_menu())
 
         # ── 操作按鈕 ─────────────────────────────────────────
         ctk.CTkButton(
-            bar, text="載入排班",
+            bar, text="載入排班", width=_W_PRIMARY,
             fg_color=_C["accent"], hover_color=_C["acc_h"],
             corner_radius=8, font=("", 13, "bold"),
             command=self._load_schedule,
-        ).pack(side="left", padx=10, pady=6)
-        ctk.CTkLabel(bar, text="雙擊格子可改班 / 刪班",
-                      text_color=_C["muted"], font=("", 12)).pack(side="left", padx=4)
-        ctk.CTkButton(bar, text="匯出 Excel", width=100,
+        ).pack(side="left", padx=(8, 6), pady=5)
+        ctk.CTkLabel(bar, text="雙擊改班/刪班",
+                      text_color=_C["muted"], font=("", 12)).pack(side="left", padx=2)
+        ctk.CTkButton(bar, text="匯出 Excel", width=_W_BTN,
                        fg_color=_C["muted"], hover_color="#6B7280",
                        corner_radius=8, command=self._export_schedule
-                       ).pack(side="right", padx=6, pady=6)
-        ctk.CTkButton(bar, text="匯入 Excel", width=100,
+                       ).pack(side="right", padx=(3, 4), pady=5)
+        ctk.CTkButton(bar, text="匯入 Excel", width=_W_BTN,
                        fg_color=_C["muted"], hover_color="#6B7280",
                        corner_radius=8, command=self._import_schedule
-                       ).pack(side="right", padx=(4, 0), pady=6)
-        self.emp_filter_btn = ctk.CTkButton(
-            bar, text="篩選員工", width=110,
+                       ).pack(side="right", padx=(3, 0), pady=5)
+        ctk.CTkButton(bar, text="特休餘額", width=_W_BTN,
+                       fg_color=_C["accent"], hover_color=_C["acc_h"],
+                       corner_radius=8, command=self._show_annual_leave
+                       ).pack(side="right", padx=(3, 0), pady=5)
+        ctk.CTkButton(bar, text="到職日", width=_W_BTN,
+                       fg_color=_C["tab_bg"], text_color=_C["ink"],
+                       hover_color=_C["line"],
+                       corner_radius=8, command=self._show_staff_info
+                       ).pack(side="right", padx=(3, 0), pady=5)
+        self.sched_emp_btn = ctk.CTkButton(
+            bar, text="員工：全員 ▼", width=_W_FILTER,
             fg_color=_C["tab_bg"], text_color=_C["ink"], hover_color=_C["line"],
-            corner_radius=8, command=self._open_sched_emp_filter)
-        self.emp_filter_btn.pack(side="right", padx=(4, 0), pady=6)
-        ctk.CTkButton(
-            bar, text="特休餘額", width=100,
-            fg_color=_C["accent"], hover_color=_C["acc_h"],
-            corner_radius=8, command=self._show_annual_leave
-            ).pack(side="right", padx=(4, 0), pady=6)
-        ctk.CTkButton(
-            bar, text="到職日", width=90,
+            corner_radius=8, command=self._open_sched_emp_picker)
+        self.sched_emp_btn.pack(side="right", padx=(3, 0), pady=5)
+        self.sched_dept_btn = ctk.CTkButton(
+            bar, text="部門：全部 ▼", width=_W_FILTER,
             fg_color=_C["tab_bg"], text_color=_C["ink"], hover_color=_C["line"],
-            corner_radius=8, command=self._show_staff_info
-            ).pack(side="right", padx=(4, 0), pady=6)
+            corner_radius=8, command=self._open_sched_dept_picker)
+        self.sched_dept_btn.pack(side="right", padx=(3, 0), pady=5)
 
         # ── 排班格 ───────────────────────────────────────────
         wrap = tk.Frame(tab, bg=_C["app_bg"])
@@ -779,21 +1091,18 @@ class EhrsApp(ctk.CTk):
                             border_width=1, border_color=_C["line"])
         bar.pack(fill="x", padx=6, pady=6)
         today = dt.date.today()
-        self.p_start = ctk.CTkEntry(bar, width=110, border_color=_C["line"],
+        self.p_start = ctk.CTkEntry(bar, width=100, border_color=_C["line"],
                                       fg_color=_C["white"], text_color=_C["ink"])
         self.p_start.insert(0, today.replace(day=1).isoformat())
-        self.p_end = ctk.CTkEntry(bar, width=110, border_color=_C["line"],
+        self.p_end = ctk.CTkEntry(bar, width=100, border_color=_C["line"],
                                     fg_color=_C["white"], text_color=_C["ink"])
         self.p_end.insert(0, today.isoformat())
-        self._selected_emps: set[str] = set()    # empty = 全員
-        self._selected_depts: set[str] = set()   # empty = 全部門
-        self._emp_dept: dict[str, str] = {}      # emp_id -> 部門名稱
         self.p_dept_btn = ctk.CTkButton(
-            bar, text="部門：全部 ▼", width=130, **_btn_outline,
+            bar, text="部門：全部 ▼", width=_W_FILTER, **_btn_outline,
             command=self._open_dept_picker
         )
         self.p_emp_btn = ctk.CTkButton(
-            bar, text="員工：全員 ▼", width=130, **_btn_outline,
+            bar, text="員工：全員 ▼", width=_W_FILTER, **_btn_outline,
             command=self._open_emp_picker
         )
         self.p_show_err   = ctk.CTkCheckBox(bar, text="異常",
@@ -809,28 +1118,28 @@ class EhrsApp(ctk.CTk):
         self.p_show_ot.select()
         self.p_show_leave.select()
         ctk.CTkLabel(bar, text="起", text_color=_C["ink"],
-                      font=("", 13)).pack(side="left", padx=(12, 2))
-        self.p_start.pack(side="left", pady=6)
+                      font=("", 13)).pack(side="left", padx=(8, 2))
+        self.p_start.pack(side="left", pady=5)
         ctk.CTkLabel(bar, text="迄", text_color=_C["ink"],
-                      font=("", 13)).pack(side="left", padx=(10, 2))
-        self.p_end.pack(side="left", pady=6)
-        self.p_dept_btn.pack(side="left", padx=(10, 0), pady=6)
-        self.p_emp_btn.pack(side="left", padx=(6, 0), pady=6)
-        self.p_show_err.pack(side="left", padx=(10, 4))
-        self.p_show_ot.pack(side="left", padx=4)
-        self.p_show_leave.pack(side="left", padx=(4, 6))
-        ctk.CTkButton(bar, text="查詢打卡",
+                      font=("", 13)).pack(side="left", padx=(8, 2))
+        self.p_end.pack(side="left", pady=5)
+        self.p_dept_btn.pack(side="left", padx=(8, 0), pady=5)
+        self.p_emp_btn.pack(side="left", padx=(4, 0), pady=5)
+        self.p_show_err.pack(side="left", padx=(8, 2))
+        self.p_show_ot.pack(side="left", padx=2)
+        self.p_show_leave.pack(side="left", padx=(2, 4))
+        ctk.CTkButton(bar, text="查詢打卡", width=_W_PRIMARY,
                        fg_color=_C["accent"], hover_color=_C["acc_h"],
                        corner_radius=8, font=("", 13, "bold"),
-                       command=self._query_punch).pack(side="left", padx=12, pady=6)
-        ctk.CTkButton(bar, text="匯出 Excel", width=100,
+                       command=self._query_punch).pack(side="left", padx=(8, 4), pady=5)
+        ctk.CTkButton(bar, text="匯出 Excel", width=_W_BTN,
                        fg_color=_C["muted"], hover_color="#6B7280",
                        corner_radius=8, command=self._export_punch
-                       ).pack(side="right", padx=6, pady=6)
-        ctk.CTkButton(bar, text="出勤統計", width=100,
+                       ).pack(side="right", padx=(3, 4), pady=5)
+        ctk.CTkButton(bar, text="出勤統計", width=_W_BTN,
                        fg_color=_C["accent"], hover_color=_C["acc_h"],
                        corner_radius=8, command=self._show_attendance_stats
-                       ).pack(side="right", padx=(0, 4), pady=6)
+                       ).pack(side="right", padx=(0, 3), pady=5)
 
         wrap = tk.Frame(tab, bg=_C["app_bg"])
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
@@ -847,27 +1156,24 @@ class EhrsApp(ctk.CTk):
                             border_width=1, border_color=_C["line"])
         bar.pack(fill="x", padx=6, pady=6)
 
-        self._raw_selected_depts: set[str] = set()
-        self._raw_selected_emps:  set[str] = set()
-
         self.raw_dept_btn = ctk.CTkButton(
-            bar, text="部門：全部 ▼", width=130, **_btn_outline,
+            bar, text="部門：全部 ▼", width=_W_FILTER, **_btn_outline,
             command=self._open_raw_dept_picker
         )
         self.raw_emp_btn = ctk.CTkButton(
-            bar, text="員工：全員 ▼", width=130, **_btn_outline,
+            bar, text="員工：全員 ▼", width=_W_FILTER, **_btn_outline,
             command=self._open_raw_emp_picker
         )
         self.raw_count_lbl = ctk.CTkLabel(bar, text="共 0 筆",
                                             text_color=_C["muted"], font=("", 12))
 
-        self.raw_dept_btn.pack(side="left", padx=(12, 0), pady=6)
-        self.raw_emp_btn.pack(side="left", padx=(6, 0), pady=6)
-        self.raw_count_lbl.pack(side="left", padx=10)
-        ctk.CTkButton(bar, text="匯出 Excel", width=100,
+        self.raw_dept_btn.pack(side="left", padx=(8, 0), pady=5)
+        self.raw_emp_btn.pack(side="left", padx=(4, 0), pady=5)
+        self.raw_count_lbl.pack(side="left", padx=8)
+        ctk.CTkButton(bar, text="匯出 Excel", width=_W_BTN,
                        fg_color=_C["muted"], hover_color="#6B7280",
                        corner_radius=8, command=self._export_raw_punch
-                       ).pack(side="right", padx=6, pady=6)
+                       ).pack(side="right", padx=(3, 4), pady=5)
 
         wrap = tk.Frame(tab, bg=_C["app_bg"])
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
@@ -893,25 +1199,26 @@ class EhrsApp(ctk.CTk):
         xsb.grid(row=1, column=0, sticky="ew")
         wrap.rowconfigure(0, weight=1)
         wrap.columnconfigure(0, weight=1)
+        _bind_mousewheel(self.raw_tv)
 
     def _populate_raw_punch(self) -> None:
         rows = self._raw_punch_rows
         # 套用篩選
         def _match(r: dict) -> bool:
-            eid  = r.get("員工代號", "")
-            dept = r.get("部門名稱") or r.get("pa51014FullName", "")
-            if self._raw_selected_depts and dept not in self._raw_selected_depts:
+            eid  = _first_field(r, _EMP_ID_KEYS)
+            dept = self._emp_filter_dept(eid, row=r)
+            if not self._dept_passes_filter(dept):
                 return False
-            if self._raw_selected_emps and eid not in self._raw_selected_emps:
+            if self._selected_emps and eid not in self._selected_emps:
                 return False
             return True
 
         filtered = [r for r in rows if _match(r)]
         self.raw_tv.delete(*self.raw_tv.get_children())
         for r in filtered:
-            dept   = r.get("部門名稱") or r.get("pa51014FullName", "")
-            eid    = r.get("員工代號", "")
-            ename  = r.get("員工姓名", "")
+            eid    = _first_field(r, _EMP_ID_KEYS)
+            dept   = self._emp_filter_dept(eid, row=r)
+            ename  = _first_field(r, _EMP_NAME_KEYS)
             date   = str(r.get("出勤日期", ""))[:10]
             time_  = str(r.get("刷卡時間", ""))[11:16]
             jz     = r.get("結轉註記", "")
@@ -922,7 +1229,7 @@ class EhrsApp(ctk.CTk):
     # ── 打卡紀錄篩選器 ────────────────────────────────────────
     def _open_raw_dept_picker(self) -> None:
         depts = sorted({
-            r.get("部門名稱") or r.get("pa51014FullName", "")
+            self._emp_filter_dept(_first_field(r, _EMP_ID_KEYS), row=r)
             for r in self._raw_punch_rows
         } - {""})
         if not depts:
@@ -930,24 +1237,18 @@ class EhrsApp(ctk.CTk):
             return
         self._generic_picker(
             title="選擇部門", items=depts,
-            selected=self._raw_selected_depts,
-            on_confirm=lambda s: (
-                setattr(self, "_raw_selected_depts", s),
-                self.raw_dept_btn.configure(
-                    text="部門：全部 ▼" if not s else f"部門：已選 {len(s)} ▼"
-                ),
-                self._populate_raw_punch(),
-            )
+            selected=self._selected_depts,
+            on_confirm=lambda s: self._set_global_filter(depts=s)
         )
 
     def _open_raw_emp_picker(self) -> None:
         emps: dict[str, str] = {}
         for r in self._raw_punch_rows:
-            eid = r.get("員工代號", "")
-            name = r.get("員工姓名", "")
+            eid = _first_field(r, _EMP_ID_KEYS)
+            name = _first_field(r, _EMP_NAME_KEYS)
             # 只顯示符合部門篩選的員工
-            dept = r.get("部門名稱") or r.get("pa51014FullName", "")
-            if self._raw_selected_depts and dept not in self._raw_selected_depts:
+            dept = self._emp_filter_dept(eid, row=r)
+            if not self._dept_passes_filter(dept):
                 continue
             if eid:
                 emps[eid] = name
@@ -957,14 +1258,9 @@ class EhrsApp(ctk.CTk):
         self._generic_picker(
             title="選擇員工",
             items=[f"{eid}  {name}" for eid, name in sorted(emps.items())],
-            selected={f"{eid}  {emps[eid]}" for eid in self._raw_selected_emps if eid in emps},
-            on_confirm=lambda s: (
-                setattr(self, "_raw_selected_emps",
-                        {item.split()[0] for item in s}),
-                self.raw_emp_btn.configure(
-                    text="員工：全員 ▼" if not s else f"員工：已選 {len(s)} 人 ▼"
-                ),
-                self._populate_raw_punch(),
+            selected={f"{eid}  {emps[eid]}" for eid in self._selected_emps if eid in emps},
+            on_confirm=lambda s: self._set_global_filter(
+                emps={item.split()[0] for item in s}
             ),
             searchable=True,
         )
@@ -993,6 +1289,7 @@ class EhrsApp(ctk.CTk):
         scroll = ctk.CTkScrollableFrame(top, fg_color=_C["white"],
                                           corner_radius=8,
                                           border_width=1, border_color=_C["line"])
+        _bind_scrollable_frame_mousewheel(scroll)
         scroll.pack(fill="both", expand=True, padx=12,
                      pady=(8 if not searchable else 4, 0))
 
@@ -1244,27 +1541,30 @@ class EhrsApp(ctk.CTk):
             self._set_status(f"載入 {period_lbl} 排班中…")
 
             def work_p():
+                results, failures = self._fetch_month_schedules(months_needed)
                 emp_map: dict[str, object] = {}
-                for yr, mn in sorted(months_needed):
-                    try:
-                        for emp in self.client.get_schedule(yr, mn):
-                            if emp.emp_id not in emp_map:
-                                emp_map[emp.emp_id] = emp
-                            else:
-                                existing = {s.date for s in emp_map[emp.emp_id].shifts}
-                                for s in emp.shifts:
-                                    if s.date not in existing:
-                                        emp_map[emp.emp_id].shifts.append(s)
-                    except Exception:
-                        pass
-                return list(emp_map.values()), dates
+                for ym in sorted(results):           # 早的月份先處理(維持原合併順序)
+                    for emp in results[ym]:
+                        if emp.emp_id not in emp_map:
+                            emp_map[emp.emp_id] = emp
+                        else:
+                            existing = {s.date for s in emp_map[emp.emp_id].shifts}
+                            for s in emp.shifts:
+                                if s.date not in existing:
+                                    emp_map[emp.emp_id].shifts.append(s)
+                return list(emp_map.values()), dates, self._fetch_emp_dept_map(start, end), failures
 
             def done_p(result):
-                sched, dates = result
+                sched, dates, dept_map, failures = result
                 self.schedule = sched
+                for eid, dept in dept_map.items():
+                    self._remember_emp_dept(eid, dept)
+                self._refresh_sched_emp_dept(sched)
                 self._build_code_map(sched)
                 self._populate_grid_period(dates, sched)
-                self._set_status(f"已載入 {period_lbl} 排班（共 {len(sched)} 人）")
+                self._set_status(
+                    f"已載入 {period_lbl} 排班（共 {len(sched)} 人）"
+                    + self._fmt_month_failures(failures))
 
             self._run_async(work_p, done_p)
         else:
@@ -1278,15 +1578,56 @@ class EhrsApp(ctk.CTk):
             self._set_status(f"載入 {year}-{month:02d} 排班中…")
 
             def work():
-                return self.client.get_schedule(year, month)
+                first = dt.date(year, month, 1)
+                last = dt.date(year, month, _cal.monthrange(year, month)[1])
+                return (
+                    self.client.get_schedule(year, month),
+                    self._fetch_emp_dept_map(first, last),
+                )
 
-            def done(sched):
+            def done(result):
+                sched, dept_map = result
                 self.schedule = sched
+                for eid, dept in dept_map.items():
+                    self._remember_emp_dept(eid, dept)
+                self._refresh_sched_emp_dept(sched)
                 self._build_code_map(sched)
                 self._populate_grid(year, month, sched)
                 self._set_status(f"已載入 {year}-{month:02d} 排班（共 {len(sched)} 人）")
 
             self._run_async(work, done)
+
+    def _fetch_month_schedules(self, months):
+        """並行抓多個 (year, month) 排班(沿用 set_shifts_bulk 的並行做法)。
+        回傳 (results: dict[(y,m)->list[EmployeeSchedule]], failures: list[((y,m), err)])。
+        單月失敗不中斷其他月,失敗原因收集回傳供 UI 提示(取代原本無聲 except: pass)。"""
+        months = sorted(set(months))
+        results: dict[tuple, list] = {}
+        failures: list[tuple] = []
+        lock = threading.Lock()
+
+        def _w(ym):
+            y, m = ym
+            try:
+                sched = self.client.get_schedule(y, m)
+                with lock:
+                    results[ym] = sched
+            except Exception as exc:  # noqa: BLE001
+                with lock:
+                    failures.append((ym, str(exc)))
+
+        if months:
+            with ThreadPoolExecutor(max_workers=min(6, len(months))) as pool:
+                list(pool.map(_w, months))
+        return results, failures
+
+    @staticmethod
+    def _fmt_month_failures(failures) -> str:
+        """把載入失敗的年月組成提示字串;無失敗回空字串。"""
+        if not failures:
+            return ""
+        ms = "、".join(f"{y}/{m:02d}" for (y, m), _ in failures)
+        return f"（{ms} 載入失敗，結果可能不完整）"
 
     def _build_code_map(self, sched) -> None:
         for emp in sched:
@@ -1307,7 +1648,7 @@ class EhrsApp(ctk.CTk):
         self._sched_header.set_dates(month_dates)
         emp_rows = []
         for emp in sched:
-            if not self._emp_passes_filter(emp.emp_id):
+            if not self._emp_passes_filter(emp.emp_id, emp):
                 continue
             by_day      = {int(s.date[8:10]): s.code for s in emp.shifts}
             by_day_kind = {int(s.date[8:10]): s.kind for s in emp.shifts}
@@ -1329,7 +1670,7 @@ class EhrsApp(ctk.CTk):
         self._sched_header.set_dates(dates)
         emp_rows = []
         for emp in sched:
-            if not self._emp_passes_filter(emp.emp_id):
+            if not self._emp_passes_filter(emp.emp_id, emp):
                 continue
             by_date      = {s.date: s.code for s in emp.shifts}
             by_date_kind = {s.date: s.kind for s in emp.shifts}
@@ -1428,6 +1769,7 @@ class EhrsApp(ctk.CTk):
         tv.configure(yscrollcommand=sb.set)
         tv.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+        _bind_mousewheel(tv)
 
         def _fill(typed: str = "") -> None:
             tv.delete(*tv.get_children())
@@ -1575,7 +1917,7 @@ class EhrsApp(ctk.CTk):
             for i in range(4, len(dates_obj) + 4):
                 ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = 7
             for emp in self.schedule:
-                if not self._emp_passes_filter(emp.emp_id):
+                if not self._emp_passes_filter(emp.emp_id, emp):
                     continue
                 by_day = {s.date: s.code for s in emp.shifts}
                 total_h = sum(
@@ -1630,9 +1972,8 @@ class EhrsApp(ctk.CTk):
     # ── 出勤統計 ───────────────────────────────────────────────────────────────
     def _compute_attendance_stats(self) -> list[tuple]:
         """從 _punch_cache 算每人出勤摘要。"""
-        _ERR_K = ("遲到", "上班忘打卡", "早退", "下班忘打卡", "曠職")
         stats: dict[str, dict] = {}
-        for vals, _ in self._punch_cache:
+        for vals, _fgs, meta in self._punch_cache:
             emp_id, name, date, code, sched_in, sched_out, clock_in, clock_out, remark = vals
             if emp_id not in stats:
                 stats[emp_id] = dict(name=name, sched=0, work=0,
@@ -1640,8 +1981,8 @@ class EhrsApp(ctk.CTk):
                                      leave=0, absent=0, late=0, early=0)
             s = stats[emp_id]
             remark = remark or ""
-            is_err   = any(k in remark for k in _ERR_K)
-            is_ot    = "加班" in remark
+            is_err   = any(k in remark for k in _REMARK_ERR_KEYWORDS)
+            is_ot    = _REMARK_OT_KEYWORD in remark
             is_leave = bool(remark) and not is_err and not is_ot
             if code and not _is_rest(code):
                 s['sched'] += 1
@@ -1655,9 +1996,8 @@ class EhrsApp(ctk.CTk):
                 if h > 9:   h -= 1
                 elif h > 4: h -= 0.5
                 s['total_h'] += max(0, h)
-            if is_ot:
-                m = re.search(r'加班([\d.]+)h', remark)
-                if m: s['ot_h'] += float(m.group(1))
+            # 加班時數直接讀 meta(由 _overtime_hours 單一來源算出),不再從備注字串反解
+            s['ot_h'] += meta.get("overtime_hours", 0.0)
             if is_leave:         s['leave']  += 1
             if '曠職' in remark: s['absent'] += 1
             if '遲到' in remark: s['late']   += 1
@@ -1706,6 +2046,7 @@ class EhrsApp(ctk.CTk):
         tv.configure(yscrollcommand=vsb.set)
         tv.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
+        _bind_mousewheel(tv)
 
         def _export():
             path = filedialog.asksaveasfilename(
@@ -1749,23 +2090,30 @@ class EhrsApp(ctk.CTk):
 
     # -------------------------------------------------------------- 特休餘額
     def _show_annual_leave(self) -> None:
-        """彈出視窗顯示所有(或已篩選)員工的特休剩餘天數與到期日期。"""
+        """彈出視窗顯示目前排班篩選下員工的特休剩餘天數與到期日期。"""
         if not self._need_client():
             return
         if not self.schedule:
             messagebox.showinfo("尚未載入", "請先按「載入排班」載入員工後再查特休。")
             return
 
-        # 套用主畫面員工篩選(空集合=全部員工)
         emps = []
-        for e in self.schedule:
-            if self._sched_emp_filter and e.emp_id not in self._sched_emp_filter:
+        for emp in self.schedule:
+            if not self._emp_passes_filter(emp.emp_id, emp):
                 continue
+            raw = emp.raw or {}
+            dept_code = (
+                _first_field(raw, _DEPT_CODE_KEYS)
+                or self._emp_dept_code.get(emp.emp_id, "")
+                or self._dept_code_key(self._schedule_emp_dept(emp))
+                or self._dept_code_key(self._emp_filter_dept(emp.emp_id))
+            )
             emps.append({
-                "emp_id": e.emp_id,
-                "name": e.name,
-                "dept": (e.raw or {}).get("pa51014") or "68",
+                "emp_id": emp.emp_id,
+                "name": emp.name,
+                "dept": dept_code,
             })
+
         if not emps:
             messagebox.showinfo("無員工", "目前篩選後沒有員工可查。")
             return
@@ -1793,9 +2141,9 @@ class EhrsApp(ctk.CTk):
     def _render_annual_leave_window(self, rows: list) -> None:
         today = dt.date.today()
 
-        def _fmt_date(s) -> str:
-            s = str(s or "").strip()
-            return s[:10] if len(s) >= 10 else s
+        def _fmt_date(value) -> str:
+            text = str(value or "").strip()
+            return text[:10] if len(text) >= 10 else text
 
         def _soon(end_str, left_days) -> bool:
             try:
@@ -1808,37 +2156,36 @@ class EhrsApp(ctk.CTk):
                 ld = 0.0
             return ld > 0 and today <= ed <= today + dt.timedelta(days=90)
 
-        _COLS = [
+        cols = [
             ("員工代號", 80), ("員工姓名", 90), ("年度", 55), ("年資", 70),
             ("剩餘天數", 75), ("剩餘時數", 75), ("給假天數", 75), ("已用天數", 75),
             ("啟用日期", 95), ("到期日期", 95), ("備註", 130),
         ]
-        col_ids = [f"c{i}" for i in range(len(_COLS))]
+        col_ids = [f"c{i}" for i in range(len(cols))]
 
-        # 攤平成顯示用 tuple,並標記底色 tag
         disp = []
-        for r in rows:
-            note = r.get("note") or r.get("error") or ""
-            left_min = r.get("left_minutes") or 0
+        for row in rows:
+            note = row.get("note") or row.get("error") or ""
+            left_min = row.get("left_minutes") or 0
             left_h = round(left_min / 60, 1) if left_min else 0
-            year = r.get("year")
-            seniority = r.get("seniority")
+            year = row.get("year")
+            seniority = row.get("seniority")
             vals = (
-                r.get("emp_id", ""),
-                r.get("name", ""),
+                row.get("emp_id", ""),
+                row.get("name", ""),
                 "" if year in (None, "") else year,
                 "" if seniority in (None, "") else seniority,
-                "" if note else r.get("left_days", 0),
+                "" if note else row.get("left_days", 0),
                 "" if note else left_h,
-                "" if note else r.get("granted_days", 0),
-                "" if note else r.get("used_days", 0),
-                _fmt_date(r.get("start_date", "")),
-                _fmt_date(r.get("end_date", "")),
+                "" if note else row.get("granted_days", 0),
+                "" if note else row.get("used_days", 0),
+                _fmt_date(row.get("start_date", "")),
+                _fmt_date(row.get("end_date", "")),
                 note,
             )
-            if r.get("error"):
+            if row.get("error"):
                 tag = "err"
-            elif _soon(r.get("end_date", ""), r.get("left_days")):
+            elif _soon(row.get("end_date", ""), row.get("left_days")):
                 tag = "soon"
             else:
                 tag = ""
@@ -1861,10 +2208,10 @@ class EhrsApp(ctk.CTk):
 
         tv = ttk.Treeview(wrap, style="App.Treeview",
                           columns=col_ids, show="headings", height=18)
-        for cid, (hdr, w) in zip(col_ids, _COLS):
+        for cid, (hdr, width) in zip(col_ids, cols):
             tv.heading(cid, text=hdr)
-            anc = "w" if hdr in ("員工代號", "員工姓名", "備註") else "center"
-            tv.column(cid, width=w, anchor=anc, stretch=False)
+            anchor = "w" if hdr in ("員工代號", "員工姓名", "備註") else "center"
+            tv.column(cid, width=width, anchor=anchor, stretch=False)
         tv.tag_configure("soon", background="#FFE8D6")
         tv.tag_configure("err", background="#FBE0DC")
         for vals, tag in disp:
@@ -1873,6 +2220,7 @@ class EhrsApp(ctk.CTk):
         tv.configure(yscrollcommand=vsb.set)
         tv.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
+        _bind_mousewheel(tv)
 
         def _export():
             path = filedialog.asksaveasfilename(
@@ -1886,7 +2234,7 @@ class EhrsApp(ctk.CTk):
             wb = openpyxl.Workbook()
             ws = wb.active
             ws.title = "特休餘額"
-            ws.append([h for h, _ in _COLS])
+            ws.append([h for h, _ in cols])
             hdr_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2",
                                    fill_type="solid")
             for cell in ws[1]:
@@ -1905,13 +2253,13 @@ class EhrsApp(ctk.CTk):
                     for cell in ws[ws.max_row]:
                         cell.fill = fill
             col_ws = [10, 12, 7, 10, 9, 9, 9, 9, 12, 12, 18]
-            for i, w in enumerate(col_ws, start=1):
-                ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
-            for r in ws.iter_rows(min_row=2):
-                for cell in r:
+            for i, width in enumerate(col_ws, start=1):
+                ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = width
+            for row in ws.iter_rows(min_row=2):
+                for cell in row:
                     cell.alignment = Alignment(horizontal="center")
-                r[1].alignment = Alignment(horizontal="left")
-                r[10].alignment = Alignment(horizontal="left")
+                row[1].alignment = Alignment(horizontal="left")
+                row[10].alignment = Alignment(horizontal="left")
             try:
                 wb.save(path)
                 messagebox.showinfo("完成", f"已匯出 {len(disp)} 列特休 → {path}",
@@ -1925,44 +2273,43 @@ class EhrsApp(ctk.CTk):
 
     # -------------------------------------------------------------- 到職日
     def _show_staff_info(self) -> None:
-        """彈窗顯示夥伴(員工)的到職日與年資。資料來自已載入的排班，免再連線。"""
+        """顯示目前排班篩選下員工的到職日與年資。"""
         if not self.schedule:
             messagebox.showinfo("尚未載入", "請先按「載入排班」載入員工後再查到職日。")
             return
 
         today = dt.date.today()
 
-        def _fmt_date(s) -> str:
-            s = str(s or "").strip()
-            return s[:10] if len(s) >= 10 else s
+        def _fmt_date(value) -> str:
+            text = str(value or "").strip()
+            return text[:10] if len(text) >= 10 else text
 
         def _seniority(hire_iso: str) -> str:
             try:
-                hd = dt.date.fromisoformat(_fmt_date(hire_iso))
+                hire_date = dt.date.fromisoformat(_fmt_date(hire_iso))
             except ValueError:
                 return ""
-            months = (today.year - hd.year) * 12 + (today.month - hd.month)
-            if today.day < hd.day:
+            months = (today.year - hire_date.year) * 12 + (today.month - hire_date.month)
+            if today.day < hire_date.day:
                 months -= 1
             if months < 0:
                 return ""
             return f"{months // 12}年{months % 12}月"
 
         rows = []
-        for e in self.schedule:
-            if self._sched_emp_filter and e.emp_id not in self._sched_emp_filter:
+        for emp in self.schedule:
+            if not self._emp_passes_filter(emp.emp_id, emp):
                 continue
-            hire = _fmt_date(getattr(e, "hire_date", "") or e.raw.get("pa51024", ""))
-            rows.append((e.emp_id, e.name, e.title or "", hire, _seniority(hire)))
+            hire = _fmt_date(getattr(emp, "hire_date", "") or emp.raw.get("pa51024", ""))
+            rows.append((emp.emp_id, emp.name, emp.title or "", hire, _seniority(hire)))
         if not rows:
             messagebox.showinfo("無員工", "目前篩選後沒有員工可顯示。")
             return
-        # 依到職日排序(資深在前);無到職日者排最後
-        rows.sort(key=lambda r: (r[3] == "", r[3]))
+        rows.sort(key=lambda row: (row[3] == "", row[3]))
 
-        _COLS = [("員工代號", 90), ("員工姓名", 110), ("職稱", 150),
-                 ("到職日", 110), ("年資", 90)]
-        col_ids = [f"c{i}" for i in range(len(_COLS))]
+        cols = [("員工代號", 90), ("員工姓名", 110), ("職稱", 150),
+                ("到職日", 110), ("年資", 90)]
+        col_ids = [f"c{i}" for i in range(len(cols))]
 
         top = ctk.CTkToplevel(self)
         top.title(f"夥伴到職日　共 {len(rows)} 人")
@@ -1970,24 +2317,26 @@ class EhrsApp(ctk.CTk):
         top.configure(fg_color=_C["app_bg"])
         top.transient(self)
 
-        ctk.CTkLabel(top, text="依到職日排序（資深在前）。年資為到今日的概算。",
-                     text_color=_C["muted"], font=("", 12)).pack(
-            anchor="w", padx=12, pady=(10, 0))
+        ctk.CTkLabel(
+            top, text="依到職日排序（資深在前）。年資為到今日的概算。",
+            text_color=_C["muted"], font=("", 12),
+        ).pack(anchor="w", padx=12, pady=(10, 0))
 
         wrap = tk.Frame(top, bg=_C["app_bg"])
         wrap.pack(fill="both", expand=True, padx=10, pady=(6, 0))
         tv = ttk.Treeview(wrap, style="App.Treeview",
                           columns=col_ids, show="headings", height=18)
-        for cid, (hdr, w) in zip(col_ids, _COLS):
+        for cid, (hdr, width) in zip(col_ids, cols):
             tv.heading(cid, text=hdr)
-            anc = "center" if hdr in ("到職日", "年資") else "w"
-            tv.column(cid, width=w, anchor=anc, stretch=False)
+            anchor = "center" if hdr in ("到職日", "年資") else "w"
+            tv.column(cid, width=width, anchor=anchor, stretch=False)
         for row in rows:
             tv.insert("", "end", values=row)
         vsb = ttk.Scrollbar(wrap, orient="vertical", command=tv.yview)
         tv.configure(yscrollcommand=vsb.set)
         tv.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
+        _bind_mousewheel(tv)
 
         def _export():
             path = filedialog.asksaveasfilename(
@@ -2001,7 +2350,7 @@ class EhrsApp(ctk.CTk):
             wb = openpyxl.Workbook()
             ws = wb.active
             ws.title = "到職日"
-            ws.append([h for h, _ in _COLS])
+            ws.append([h for h, _ in cols])
             hdr_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2",
                                    fill_type="solid")
             for cell in ws[1]:
@@ -2011,13 +2360,13 @@ class EhrsApp(ctk.CTk):
             for row in rows:
                 ws.append(list(row))
             col_ws = [12, 14, 20, 14, 10]
-            for i, w in enumerate(col_ws, start=1):
-                ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
-            for r in ws.iter_rows(min_row=2):
-                for cell in r:
+            for i, width in enumerate(col_ws, start=1):
+                ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = width
+            for row in ws.iter_rows(min_row=2):
+                for cell in row:
                     cell.alignment = Alignment(horizontal="center")
                 for idx in (0, 1, 2):
-                    r[idx].alignment = Alignment(horizontal="left")
+                    row[idx].alignment = Alignment(horizontal="left")
             try:
                 wb.save(path)
                 messagebox.showinfo("完成", f"已匯出 {len(rows)} 人到職日 → {path}",
@@ -2085,17 +2434,19 @@ class EhrsApp(ctk.CTk):
             messagebox.showinfo("無班別", "沒有找到任何班別資料。")
             return
 
-        # 套用主畫面員工篩選（若有設定）
-        if self._sched_emp_filter:
+        # 套用排班頁部門 / 員工篩選（若有設定）
+        if self._selected_depts or self._selected_emps:
             changes = [ch for ch in changes
-                       if ch["emp_id"] in self._sched_emp_filter]
+                       if self._emp_passes_filter(ch["emp_id"])]
             if not changes:
                 messagebox.showinfo(
                     "無符合員工",
-                    "目前篩選的員工在這份 Excel 中沒有班別資料。")
+                    "目前排班篩選條件在這份 Excel 中沒有班別資料。")
                 return
         n_emps = len({ch["emp_id"] for ch in changes})
-        filt_note = "（已套用員工篩選）" if self._sched_emp_filter else ""
+        filt_note = "（已套用排班篩選）" if (
+            self._selected_depts or self._selected_emps
+        ) else ""
         if not messagebox.askyesno(
             "確認匯入",
             f"將匯入 {year}-{month:02d} 排班，共 {len(changes)} 筆"
@@ -2177,6 +2528,7 @@ class EhrsApp(ctk.CTk):
         scroll = ctk.CTkScrollableFrame(top, fg_color=_C["white"],
                                           corner_radius=8, border_width=1,
                                           border_color=_C["line"])
+        _bind_scrollable_frame_mousewheel(scroll)
         scroll.pack(fill="both", expand=True, padx=12, pady=(4, 0))
 
         chk_vars: dict[str, tk.BooleanVar] = {}
@@ -2225,37 +2577,232 @@ class EhrsApp(ctk.CTk):
         top.wait_window()
         return result["value"]
 
-    # ── 主畫面員工篩選 ─────────────────────────────────────────────────────
-    def _emp_passes_filter(self, emp_id: str) -> bool:
-        """空篩選集合代表「全部」；否則只放行集合內的員工。"""
-        return not self._sched_emp_filter or emp_id in self._sched_emp_filter
+    # ── 排班頁部門 / 員工篩選 ───────────────────────────────────────────────
+    def _fetch_emp_dept_map(self, start: dt.date, end: dt.date) -> dict[str, str]:
+        rows = None
+        # B1:若剛在打卡分頁查過同一區間,直接重用那批資料(含部門欄位),免重抓。
+        if (self._raw_punch_range == (start.isoformat(), end.isoformat())
+                and self._raw_punch_rows):
+            rows = self._raw_punch_rows
+        if rows is None:
+            try:
+                rows = self.client.get_punch_records(start, end, readable=False)
+            except Exception:
+                return {}
+        dept_map: dict[str, str] = {}
+        base_dept = ""
+        for row in rows:
+            eid = _first_field(row, _EMP_ID_KEYS)
+            dept = self._row_dept(row)
+            if eid and dept:
+                dept_map[eid] = dept
+                name = self._dept_name_key(dept)
+                if not base_dept and name and "維修中心" not in name and "(前)" not in name:
+                    base_dept = dept
+        if base_dept and (end - start).days == 27 and start.weekday() == 0:
+            for eid in self._fetch_period_emp_ids(start, end):
+                dept_map.setdefault(eid, base_dept)
+        return dept_map
 
-    def _update_emp_filter_btn(self) -> None:
-        n = len(self._sched_emp_filter)
-        self.emp_filter_btn.configure(
-            text=f"篩選：{n} 人" if n else "篩選員工"
+    def _fetch_period_emp_ids(self, start: dt.date, end: dt.date) -> set[str]:
+        emp_ids: set[str] = set()
+        for flex_type in (0, 1, 2):
+            try:
+                cal = self.client.get_schedule_raw(
+                    start.year, start.month,
+                    shiftType=1, flexType=flex_type,
+                    start=f"{start.isoformat()}T00:00:00.000",
+                    end=f"{end.isoformat()}T23:59:59.000",
+                )
+            except Exception:
+                continue
+            for emp in cal.get("shiftEmployees", []):
+                eid = str(emp.get("pa51002") or "").strip()
+                if eid:
+                    emp_ids.add(eid)
+        return emp_ids
+
+    def _schedule_emp_dept(self, emp) -> str:
+        raw = getattr(emp, "raw", {}) or {}
+        emp_id = getattr(emp, "emp_id", "")
+        return self._emp_filter_dept(emp_id, row=raw)
+
+    def _refresh_sched_emp_dept(self, sched) -> None:
+        self._sched_emp_dept = {}
+        for emp in sched:
+            dept = self._schedule_emp_dept(emp)
+            if dept:
+                self._sched_emp_dept[emp.emp_id] = dept
+
+    def _emp_passes_filter(self, emp_id: str, emp=None) -> bool:
+        """空篩選集合代表「全部」；否則同時套用部門與員工條件。"""
+        dept = self._sched_emp_dept.get(emp_id, "")
+        if not dept and emp is not None:
+            dept = self._schedule_emp_dept(emp)
+            if dept:
+                self._sched_emp_dept[emp_id] = dept
+        if not dept:
+            dept = self._emp_filter_dept(emp_id)
+        if not self._dept_passes_filter(dept):
+            return False
+        if self._selected_emps and emp_id not in self._selected_emps:
+            return False
+        return True
+
+    def _update_sched_filter_btns(self) -> None:
+        self._update_filter_buttons()
+
+    def _refresh_schedule_view(self) -> None:
+        if not self.schedule:
+            return
+        if self._grid_dates:
+            self._populate_grid_period(self._grid_dates, self.schedule)
+            return
+        try:
+            self._populate_grid(int(self.year_var.get()), int(self.month_var.get()),
+                                self.schedule)
+        except ValueError:
+            pass
+
+    def _update_filter_buttons(self) -> None:
+        dept_n = len(self._selected_depts)
+        emp_n  = len(self._selected_emps)
+        dept_text = "部門：全部 ▼" if dept_n == 0 else f"部門：已選 {dept_n} ▼"
+        emp_text  = "員工：全員 ▼" if emp_n == 0 else f"員工：已選 {emp_n} 人 ▼"
+        for attr in ("sched_dept_btn", "p_dept_btn", "raw_dept_btn", "suggest_dept_btn"):
+            if hasattr(self, attr):
+                getattr(self, attr).configure(text=dept_text)
+        for attr in ("sched_emp_btn", "p_emp_btn", "raw_emp_btn", "suggest_emp_btn"):
+            if hasattr(self, attr):
+                getattr(self, attr).configure(text=emp_text)
+
+    def _row_dept_code(self, row: dict | None) -> str:
+        return _first_field(row or {}, _DEPT_CODE_KEYS)
+
+    def _row_dept(self, row: dict | None) -> str:
+        row = row or {}
+        full = _first_field(row, _DEPT_FULL_KEYS)
+        if full:
+            return full
+        code = self._row_dept_code(row)
+        name = _first_field(row, _DEPT_NAME_KEYS)
+        if code and name:
+            return f"{code} {name}"
+        return name or code or _first_field(row, _DEPT_KEYS)
+
+    def _dept_code_key(self, dept: str) -> str:
+        match = re.match(r"^\s*(\d+(?:-\d+)?)\b", str(dept or ""))
+        return match.group(1) if match else ""
+
+    def _dept_name_key(self, dept: str) -> str:
+        dept = str(dept or "").strip()
+        return re.sub(r"^\d+\s*[-－_:：]?\s*", "", dept).strip()
+
+    def _dept_matches_one(self, dept: str, selected: str) -> bool:
+        dept_code = self._dept_code_key(dept)
+        selected_code = self._dept_code_key(selected)
+        if dept_code and selected_code:
+            return dept_code == selected_code
+        dept_key = self._dept_name_key(dept)
+        selected_key = self._dept_name_key(selected)
+        return bool(dept_key and selected_key and dept_key == selected_key)
+
+    def _dept_passes_filter(self, dept: str) -> bool:
+        if not self._selected_depts:
+            return True
+        return any(self._dept_matches_one(dept, selected)
+                   for selected in self._selected_depts)
+
+    def _remember_emp_dept(self, emp_id: str, dept: str) -> None:
+        emp_id = str(emp_id or "").strip()
+        dept = str(dept or "").strip()
+        if emp_id and dept:
+            self._emp_dept[emp_id] = dept
+            code = self._dept_code_key(dept)
+            if code:
+                self._emp_dept_code[emp_id] = code
+
+    def _emp_filter_dept(self, emp_id: str, row: dict | None = None) -> str:
+        dept = self._row_dept(row)
+        if dept:
+            self._remember_emp_dept(emp_id, dept)
+            return dept
+        return (
+            self._emp_dept.get(emp_id, "")
+            or getattr(self, "_sched_emp_dept", {}).get(emp_id, "")
         )
 
-    def _open_sched_emp_filter(self) -> None:
+    def _prune_selected_emps_for_depts(self) -> None:
+        if not self._selected_depts or not self._selected_emps:
+            return
+        self._selected_emps = {
+            eid for eid in self._selected_emps
+            if self._dept_passes_filter(self._emp_filter_dept(eid))
+        }
+
+    def _set_global_filter(
+        self,
+        *,
+        depts: set[str] | None = None,
+        emps: set[str] | None = None,
+    ) -> None:
+        if depts is not None:
+            self._selected_depts = set(depts)
+            self._prune_selected_emps_for_depts()
+        if emps is not None:
+            self._selected_emps = set(emps)
+        self._update_filter_buttons()
+        self._refresh_schedule_view()
+        if hasattr(self, "punch_tbl"):
+            self._apply_punch_filter()
+        elif hasattr(self, "suggest_table"):
+            self._compute_suggestions()
+        if hasattr(self, "raw_tv"):
+            self._populate_raw_punch()
+
+    def _open_sched_dept_picker(self) -> None:
         if not self.schedule:
             messagebox.showinfo("尚未載入", "請先按「載入排班」載入員工後再篩選。")
             return
-        emps = {e.emp_id: e.name for e in self.schedule}
-        pre = self._sched_emp_filter or set(emps)   # 空=全部 → 預設全勾
-        picked = self._pick_employees(
-            emps, preselect=pre,
-            title="篩選員工",
-            hint="只顯示／匯入／匯出勾選的員工",
-            ok_text="套用篩選",
-        )
-        if picked is None:
+        depts = sorted(set(self._sched_emp_dept.values()) - {""})
+        if not depts:
+            messagebox.showinfo("沒有部門資料", "目前排班資料沒有可篩選的部門欄位。請重新載入排班後再試。")
             return
-        # 全選 → 視為不篩選（存空集合）
-        self._sched_emp_filter = set() if len(picked) == len(emps) else picked
-        self._update_emp_filter_btn()
-        # 立即套用到目前畫面
-        if self._grid_dates:
-            self._populate_grid_period(self._grid_dates, self.schedule)
+        self._generic_picker(
+            title="選擇部門",
+            items=depts,
+            selected=self._selected_depts,
+            on_confirm=lambda s: self._set_global_filter(depts=s)
+        )
+
+    def _open_sched_emp_picker(self) -> None:
+        if not self.schedule:
+            messagebox.showinfo("尚未載入", "請先按「載入排班」載入員工後再篩選。")
+            return
+        emps: dict[str, str] = {}
+        for emp in self.schedule:
+            dept = self._schedule_emp_dept(emp)
+            if not self._dept_passes_filter(dept):
+                continue
+            emps[emp.emp_id] = emp.name
+        if not emps:
+            messagebox.showinfo("無符合員工", "目前部門篩選下沒有可選員工。")
+            return
+        items = [f"{eid}  {name}".rstrip() for eid, name in sorted(emps.items())]
+        selected = {
+            f"{eid}  {emps[eid]}".rstrip()
+            for eid in self._selected_emps
+            if eid in emps
+        }
+        self._generic_picker(
+            title="選擇員工",
+            items=items,
+            selected=selected,
+            on_confirm=lambda s: self._set_global_filter(
+                emps={item.split()[0] for item in s}
+            ),
+            searchable=True,
+        )
 
     # ---------------------------------------------------------------- punch
     def _query_punch(self) -> None:
@@ -2273,29 +2820,33 @@ class EhrsApp(ctk.CTk):
                 leave_rows = self.client.get_leave_records(start, end)
             except Exception:
                 leave_rows = []
-            sched_map: dict[tuple, tuple] = {}
-            emp_names: dict[str, str] = {}
             start_d = dt.date.fromisoformat(start)
             end_d   = dt.date.fromisoformat(end)
+            # 收集區間橫跨的所有年月,並行抓排班(取代逐月序列迴圈)
+            months: set[tuple[int, int]] = set()
             cur = start_d.replace(day=1)
             while cur <= end_d:
-                try:
-                    for es in self.client.get_schedule(cur.year, cur.month):
-                        emp_names[es.emp_id] = es.name
-                        for s in es.shifts:
-                            sched_map[(es.emp_id, s.date)] = (s.code, s.name, s.kind)
-                except Exception:
-                    pass
+                months.add((cur.year, cur.month))
                 cur = (cur.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
-            return punch_rows, leave_rows, sched_map, emp_names, start, end
+            results, failures = self._fetch_month_schedules(months)
+            sched_map: dict[tuple, tuple] = {}
+            emp_names: dict[str, str] = {}
+            for ym in sorted(results):
+                for es in results[ym]:
+                    emp_names[es.emp_id] = es.name
+                    for s in es.shifts:
+                        sched_map[(es.emp_id, s.date)] = (s.code, s.name, s.kind)
+            return punch_rows, leave_rows, sched_map, emp_names, start, end, failures
 
         def done(result):
-            punch_rows, leave_rows, sched_map, emp_names, s, e = result
+            punch_rows, leave_rows, sched_map, emp_names, s, e, failures = result
             self._raw_punch_rows = list(punch_rows)
+            self._raw_punch_range = (s, e)
             self._populate_punch(punch_rows, sched_map, emp_names, s, e,
                                  leave_rows=leave_rows)
             self._populate_raw_punch()
-            self._set_status(f"打卡 {start}~{end} 共 {len(punch_rows)} 筆")
+            self._set_status(f"打卡 {start}~{end} 共 {len(punch_rows)} 筆"
+                             + self._fmt_month_failures(failures))
 
         self._run_async(work, done)
 
@@ -2310,10 +2861,10 @@ class EhrsApp(ctk.CTk):
     ) -> None:
         # 0. 建立 emp_id -> 部門名稱 對照表（從原始打卡資料）
         for r in rows:
-            eid = r.get("員工代號", "")
-            dept = r.get("部門名稱") or r.get("pa51014FullName", "")
-            if eid and dept:
-                self._emp_dept[eid] = dept
+            eid = _first_field(r, _EMP_ID_KEYS)
+            self._remember_emp_dept(eid, self._row_dept(r))
+        if self.schedule:
+            self._refresh_sched_emp_dept(self.schedule)
 
         # 1. 整理有打卡的日子
         sorted_rows = sorted(rows, key=lambda r: (
@@ -2349,7 +2900,10 @@ class EhrsApp(ctk.CTk):
             else:
                 clock_in, clock_out = split_fn(use_punches, sched_in, sched_out)
             remark = _punch_remark(clock_in, clock_out, sched_in, sched_out, kind=s_kind)
-            display.append((emp_id, name, date, code, sched_in, sched_out, clock_in, clock_out, remark))
+            vals = (emp_id, name, date, code, sched_in, sched_out, clock_in, clock_out, remark)
+            meta = {"category": _classify_remark(remark),
+                    "overtime_hours": _overtime_hours(clock_in, clock_out, sched_in, sched_out, kind=s_kind)}
+            display.append((vals, meta))
 
         # 1b. 建立 leave_map：(emp_id, date) → 假別名稱（特休/病假/事假…）
         leave_map: dict[tuple, str] = {}
@@ -2377,26 +2931,25 @@ class EhrsApp(ctk.CTk):
                     name = (emp_names or {}).get(emp_id, "")
                     sched_in, sched_out = _shift_times(code) if code else ("", "")
                     remark = leave_map.get((emp_id, date), "曠職")
-                    display.append((emp_id, name, date, code, sched_in, sched_out, "", "", remark))
+                    vals = (emp_id, name, date, code, sched_in, sched_out, "", "", remark)
+                    display.append((vals, {"category": _classify_remark(remark),
+                                           "overtime_hours": 0.0}))
 
         RED    = "#CC0000"
         GREEN  = "#2A8B5A"
         ORANGE = "#C07000"
-        _ERR   = ("遲到", "上班忘打卡", "早退", "下班忘打卡", "曠職")
-        _OT    = ("加班",)   # 含「加班」「休息日加班」
         def _fgs(row: tuple) -> tuple:
             remark = row[8]
-            is_err   = remark and any(k in remark for k in _ERR)
-            is_ot    = remark and not is_err and any(k in remark for k in _OT)
-            is_leave = remark and not is_err and not is_ot
+            cat = _classify_remark(remark)
             ci_red = RED if remark and any(k in remark for k in ("遲到", "上班忘打卡", "曠職")) else ""
             co_red = RED if remark and any(k in remark for k in ("早退", "下班忘打卡", "曠職")) else ""
-            rm_col = RED if is_err else (ORANGE if is_ot else (GREEN if is_leave else ""))
+            rm_col = RED if cat == "err" else (ORANGE if cat == "ot" else (GREEN if cat == "leave" else ""))
             return ("", "", "", "", "", "", ci_red, co_red, rm_col)
 
+        # 每列存 (顯示值, 著色, meta);meta 含 category / overtime_hours,供統計與篩選直接讀。
         self._punch_cache = [
-            (row, _fgs(row))
-            for row in sorted(display, key=lambda x: (x[0], x[2]))
+            (vals, _fgs(vals), meta)
+            for vals, meta in sorted(display, key=lambda x: (x[0][0], x[0][2]))
         ]
         self._apply_punch_filter()
 
@@ -2405,21 +2958,19 @@ class EhrsApp(ctk.CTk):
         show_ot    = self.p_show_ot.get()
         show_leave = self.p_show_leave.get()
         any_filter = show_err or show_ot or show_leave
-        _ERR_K = ("遲到", "上班忘打卡", "早退", "下班忘打卡", "曠職")
 
         def _cat_match(vals) -> bool:
             if not any_filter:
                 return True
             remark = vals[8] or ""
-            is_err   = any(k in remark for k in _ERR_K)
-            is_ot    = "加班" in remark
+            is_err   = any(k in remark for k in _REMARK_ERR_KEYWORDS)
+            is_ot    = _REMARK_OT_KEYWORD in remark
             is_leave = bool(remark) and not is_err and not is_ot
             return (show_err and is_err) or (show_ot and is_ot) or (show_leave and is_leave)
 
         filtered = [
-            (vals, fgs) for vals, fgs in self._punch_cache
-            if (not self._selected_depts or
-                self._emp_dept.get(vals[0], "") in self._selected_depts)
+            (vals, fgs) for vals, fgs, _meta in self._punch_cache
+            if self._dept_passes_filter(self._emp_filter_dept(vals[0]))
             and (not self._selected_emps or vals[0] in self._selected_emps)
             and _cat_match(vals)
         ]
@@ -2427,20 +2978,16 @@ class EhrsApp(ctk.CTk):
         self.after(50, self._compute_suggestions)
 
     def _update_dept_btn(self) -> None:
-        n = len(self._selected_depts)
-        self.p_dept_btn.configure(
-            text="部門：全部 ▼" if n == 0 else f"部門：已選 {n} ▼"
-        )
+        self._update_filter_buttons()
 
     def _update_emp_btn(self) -> None:
-        n = len(self._selected_emps)
-        self.p_emp_btn.configure(
-            text="員工：全員 ▼" if n == 0 else f"員工：已選 {n} 人 ▼"
-        )
+        self._update_filter_buttons()
 
     def _open_dept_picker(self) -> None:
         # 從 _emp_dept 收集所有不重複部門
-        depts = sorted(set(self._emp_dept.values()))
+        depts = sorted(
+            (set(self._emp_dept.values()) | set(getattr(self, "_sched_emp_dept", {}).values())) - {""}
+        )
         if not depts:
             messagebox.showinfo("提示", "請先查詢打卡資料。")
             return
@@ -2456,11 +3003,12 @@ class EhrsApp(ctk.CTk):
         scroll = ctk.CTkScrollableFrame(top, fg_color=_C["white"],
                                           corner_radius=8,
                                           border_width=1, border_color=_C["line"])
+        _bind_scrollable_frame_mousewheel(scroll)
         scroll.pack(fill="both", expand=True, padx=12, pady=(12, 0))
 
         chk_vars: dict[str, tk.BooleanVar] = {}
         for dept in depts:
-            init = (not self._selected_depts) or (dept in self._selected_depts)
+            init = self._dept_passes_filter(dept)
             var = tk.BooleanVar(value=init)
             ctk.CTkCheckBox(scroll, text=dept, variable=var,
                              text_color=_C["ink"]).pack(anchor="w", padx=4, pady=3)
@@ -2481,9 +3029,9 @@ class EhrsApp(ctk.CTk):
 
         def apply():
             selected = {d for d, v in chk_vars.items() if v.get()}
-            self._selected_depts = set() if len(selected) == len(depts) else selected
-            self._update_dept_btn()
-            self._apply_punch_filter()
+            self._set_global_filter(
+                depts=set() if len(selected) == len(depts) else selected
+            )
             top.destroy()
 
         ctk.CTkButton(top, text="確定",
@@ -2494,7 +3042,10 @@ class EhrsApp(ctk.CTk):
     def _open_emp_picker(self) -> None:
         # 從打卡快取收集所有員工
         emps: dict[str, str] = {}
-        for vals, _ in self._punch_cache:
+        for vals, *_ in self._punch_cache:
+            dept = self._emp_filter_dept(vals[0])
+            if not self._dept_passes_filter(dept):
+                continue
             emps[vals[0]] = vals[1]
 
         if not emps:
@@ -2520,6 +3071,7 @@ class EhrsApp(ctk.CTk):
         scroll = ctk.CTkScrollableFrame(top, fg_color=_C["white"],
                                           corner_radius=8,
                                           border_width=1, border_color=_C["line"])
+        _bind_scrollable_frame_mousewheel(scroll)
         scroll.pack(fill="both", expand=True, padx=12, pady=(4, 0))
 
         chk_vars: dict[str, tk.BooleanVar] = {}
@@ -2560,9 +3112,9 @@ class EhrsApp(ctk.CTk):
 
         def apply():
             selected = {eid for eid, v in chk_vars.items() if v.get()}
-            self._selected_emps = set() if len(selected) == len(emps) else selected
-            self._update_emp_btn()
-            self._apply_punch_filter()
+            self._set_global_filter(
+                emps=set() if len(selected) == len(emps) else selected
+            )
             top.destroy()
 
         ctk.CTkButton(top, text="確定",
@@ -2572,41 +3124,150 @@ class EhrsApp(ctk.CTk):
 
     # --------------------------------------------------------- suggest tab
     def _build_suggest_tab(self, tab) -> None:
+        _btn_outline = dict(fg_color=_C["white"], text_color=_C["ink"],
+                             hover_color=_C["tab_bg"], border_width=1,
+                             border_color=_C["line"], corner_radius=8)
         bar = ctk.CTkFrame(tab, fg_color=_C["white"], corner_radius=8,
                             border_width=1, border_color=_C["line"])
         bar.pack(fill="x", padx=6, pady=6)
-        ctk.CTkLabel(bar, text="依打卡查詢結果建議最適班別（忘打卡不列入）",
+        self.suggest_dept_btn = ctk.CTkButton(
+            bar, text="部門：全部 ▼", width=_W_FILTER, **_btn_outline,
+            command=self._open_suggest_dept_picker
+        )
+        self.suggest_emp_btn = ctk.CTkButton(
+            bar, text="員工：全員 ▼", width=_W_FILTER, **_btn_outline,
+            command=self._open_suggest_emp_picker
+        )
+        self.suggest_type_var = ctk.StringVar(value="全部")
+        ctk.CTkLabel(bar, text="依打卡結果建議班別",
                       text_color=_C["muted"], font=("", 12)).pack(
-            side="left", padx=12, pady=8)
+            side="left", padx=(8, 6), pady=7)
+        self.suggest_dept_btn.pack(side="left", padx=(0, 4), pady=5)
+        self.suggest_emp_btn.pack(side="left", padx=(0, 6), pady=5)
+        self.suggest_type_seg = ctk.CTkSegmentedButton(
+            bar, values=["全部", "遲到早退", "加班"],
+            variable=self.suggest_type_var,
+            command=lambda _v: self._render_suggestions(),
+            selected_color=_C["accent"],
+            selected_hover_color=_C["acc_h"],
+            unselected_color=_C["tab_bg"],
+            unselected_hover_color=_C["line"],
+            text_color=_C["ink"],
+        )
+        self.suggest_type_seg.pack(side="left", padx=(0, 6), pady=5)
         self.p_overtime = ctk.CTkCheckBox(bar, text="加班建議",
                                             text_color=_C["ink"],
                                             command=self._compute_suggestions)
-        self.p_overtime.pack(side="left", padx=12)
-        ctk.CTkButton(bar, text="重新計算", width=90,
+        self.p_overtime.pack(side="left", padx=(8, 4))
+        ctk.CTkButton(bar, text="重新計算", width=_W_BTN,
                        fg_color=_C["accent"], hover_color=_C["acc_h"],
                        corner_radius=8,
                        command=self._compute_suggestions).pack(
-            side="left", padx=8, pady=6)
-        self.suggest_scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
-        self.suggest_scroll.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+            side="left", padx=(4, 6), pady=5)
+        self.suggest_count_lbl = ctk.CTkLabel(
+            bar, text="共 0 筆", text_color=_C["muted"], font=("", 12)
+        )
+        self.suggest_count_lbl.pack(side="right", padx=8)
+
+        body = tk.Frame(tab, bg=_C["app_bg"])
+        body.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=0)
+        body.rowconfigure(0, weight=1)
+        self.suggest_table = _SuggestionTable(
+            body, on_select=self._show_suggestion_detail,
+            on_apply=self._apply_best_suggestion,
+            bg=_C["app_bg"],
+        )
+        self.suggest_table.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        self.suggest_detail = ctk.CTkScrollableFrame(
+            body, width=330, fg_color=_C["white"], corner_radius=8,
+            border_width=1, border_color=_C["line"]
+        )
+        _bind_scrollable_frame_mousewheel(self.suggest_detail)
+        self.suggest_detail.grid(row=0, column=1, sticky="nsew")
+        self._suggestion_rows: list[dict] = []
+        self._suggestion_by_id: dict[str, dict] = {}
+        self._current_suggestion_id: str | None = None
+        self._clear_suggestion_detail("請先到打卡分頁查詢，或從左側列表選擇一筆建議。")
+
+    def _update_suggest_filter_btns(self) -> None:
+        self._update_filter_buttons()
+
+    def _suggest_row_passes_filter(self, vals: tuple) -> bool:
+        emp_id = vals[0]
+        dept = self._emp_filter_dept(emp_id)
+        if not self._dept_passes_filter(dept):
+            return False
+        if self._selected_emps and emp_id not in self._selected_emps:
+            return False
+        return True
+
+    def _open_suggest_dept_picker(self) -> None:
+        depts = sorted({
+            self._emp_filter_dept(vals[0])
+            for vals, *_ in self._punch_cache
+        } - {""})
+        if not depts:
+            messagebox.showinfo("提示", "請先在打卡分頁查詢資料。")
+            return
+        self._generic_picker(
+            title="選擇部門",
+            items=depts,
+            selected=self._selected_depts,
+            on_confirm=lambda s: self._set_global_filter(depts=s)
+        )
+
+    def _open_suggest_emp_picker(self) -> None:
+        emps: dict[str, str] = {}
+        for vals, *_ in self._punch_cache:
+            emp_id, name = vals[0], vals[1]
+            dept = self._emp_filter_dept(emp_id)
+            if not self._dept_passes_filter(dept):
+                continue
+            if emp_id:
+                emps[emp_id] = name
+        if not emps:
+            messagebox.showinfo("提示", "請先在打卡分頁查詢資料。")
+            return
+        items = [f"{eid}  {name}".rstrip() for eid, name in sorted(emps.items())]
+        selected = {
+            f"{eid}  {emps[eid]}".rstrip()
+            for eid in self._selected_emps
+            if eid in emps
+        }
+        self._generic_picker(
+            title="選擇員工",
+            items=items,
+            selected=selected,
+            on_confirm=lambda s: self._set_global_filter(
+                emps={item.split()[0] for item in s}
+            ),
+            searchable=True,
+        )
 
     def _compute_suggestions(self) -> None:
-        if not hasattr(self, "suggest_scroll"):
+        if not hasattr(self, "suggest_table"):
             return
-        for w in self.suggest_scroll.winfo_children():
-            w.destroy()
-
-        # 遲到/早退
-        late_early = [
-            vals for vals, _ in self._punch_cache
-            if vals[8]
-            and "忘打卡" not in vals[8]
-            and any(k in vals[8] for k in ("遲到", "早退"))
+        old_rows = getattr(self, "_suggestion_by_id", {})
+        rows: list[dict] = []
+        filtered_cache = [
+            (vals, fgs) for vals, fgs, _meta in self._punch_cache
+            if self._suggest_row_passes_filter(vals)
         ]
-        # 加班（勾選才顯示）
-        overtime: list[tuple] = []
+
+        idx = 0
+        for vals, _ in filtered_cache:
+            remark = vals[8]
+            if (remark and "忘打卡" not in remark
+                    and any(k in remark for k in ("遲到", "早退"))):
+                rows.append(self._make_suggestion_row(
+                    vals, row_type="遲到早退", row_idx=idx,
+                    old_rows=old_rows
+                ))
+                idx += 1
         if self.p_overtime.get():
-            for vals, _ in self._punch_cache:
+            for vals, _ in filtered_cache:
                 _, _, _, _, sched_in, sched_out, clock_in, clock_out, remark = vals
                 if not clock_in or not clock_out or not sched_in or not sched_out:
                     continue
@@ -2620,33 +3281,23 @@ class EhrsApp(ctk.CTk):
                 if co_m < si_m - 120:
                     co_m += 1440
                 if co_m - so_m >= 30:   # 加班 ≥ 30 分鐘才列入
-                    overtime.append(vals)
+                    rows.append(self._make_suggestion_row(
+                        vals, row_type="加班", row_idx=idx,
+                        old_rows=old_rows
+                    ))
+                    idx += 1
+        self._suggestion_rows = rows
+        self._suggestion_by_id = {row["id"]: row for row in rows}
+        self._render_suggestions()
 
-        if not late_early and not overtime:
-            ctk.CTkLabel(self.suggest_scroll,
-                         text="沒有需要建議的異常記錄（請先到打卡分頁查詢）",
-                         text_color=_C["muted"]).pack(pady=24)
-            return
-
-        if late_early:
-            ctk.CTkLabel(self.suggest_scroll, text="遲到 / 早退",
-                         font=("", 13, "bold"), text_color=_C["ink"]).pack(
-                anchor="w", padx=6, pady=(4, 0))
-            for vals in late_early:
-                self._build_suggest_card(vals, overtime_mode=False)
-
-        if overtime:
-            ctk.CTkLabel(self.suggest_scroll, text="加班",
-                         font=("", 13, "bold"), text_color=_C["ink"]).pack(
-                anchor="w", padx=6, pady=(10, 0))
-            for vals in overtime:
-                self._build_suggest_card(vals, overtime_mode=True)
-
-    def _build_suggest_card(self, vals: tuple, overtime_mode: bool = False) -> None:
+    def _make_suggestion_row(
+        self, vals: tuple, row_type: str, row_idx: int,
+        old_rows: dict[str, dict] | None = None,
+    ) -> dict:
         emp_id, name, date, shift_code, sched_in, sched_out, \
             clock_in, clock_out, remark = vals
         cur_h = _shift_hours(shift_code) or (_calc_hours(sched_in, sched_out) if sched_in and sched_out else 8.0)
-        if overtime_mode:
+        if row_type == "加班":
             if clock_in and clock_out:
                 ci_m = _punch_mins(clock_in)
                 co_m = _punch_mins(clock_out)
@@ -2661,123 +3312,240 @@ class EhrsApp(ctk.CTk):
             sugg = [s for s in _suggest_shifts(
                 clock_in, clock_out, self.shift_codes, preferred_hours=pref_h, top_n=6)
                 if s[5] > cur_h][:3]
-            hdr_color = "#1E6B42"   # 深綠
-            tag_text  = "加班建議"
         else:
             sugg = _suggest_shifts(clock_in, clock_out, self.shift_codes, preferred_hours=cur_h)
-            hdr_color = "#8B4500"   # 深橙棕
-            tag_text  = remark
+        row_id = f"{row_type}:{emp_id}:{date}:{row_idx}"
+        old = (old_rows or {}).get(row_id, {})
+        kind = self._default_suggestion_kind(emp_id, date, shift_code)
+        best = sugg[0] if sugg else None
+        shift_names = {
+            code: self.shift_codes.get(code, ("", 3))[0]
+            for code, *_ in sugg
+        }
+        return {
+            "id": row_id,
+            "emp_id": emp_id,
+            "name": name,
+            "date": date,
+            "type": row_type,
+            "remark": "加班建議" if row_type == "加班" else remark,
+            "current_shift": shift_code or "—",
+            "scheduled": self._time_range(sched_in, sched_out),
+            "actual": self._time_range(clock_in, clock_out),
+            "delta": self._candidate_delta_text(best),
+            "best_candidate": best,
+            "candidates": sugg,
+            "kind": old.get("kind", kind),
+            "status": old.get("status", "待處理"),
+            "error": old.get("error", ""),
+            "shift_names": shift_names,
+            "raw": vals,
+        }
 
-        outer = ctk.CTkFrame(self.suggest_scroll, corner_radius=10,
-                              fg_color=_C["white"],
-                              border_width=1, border_color=_C["line"])
-        outer.pack(fill="x", pady=5, padx=2)
+    @staticmethod
+    def _time_range(start: str, end: str) -> str:
+        if start and end:
+            return f"{start}-{end}"
+        return start or end or "—"
 
-        # ── 標題列 ──────────────────────────────────────────
-        hdr = ctk.CTkFrame(outer, fg_color=hdr_color, corner_radius=10)
-        hdr.pack(fill="x")
-        ctk.CTkLabel(hdr, text=f"{name}  {emp_id}",
-                      font=("", 13, "bold"), text_color="#FFFFFF").pack(
-            side="left", padx=14, pady=8)
-        ctk.CTkLabel(hdr, text=date,
-                      text_color="#FFDDC0", font=("", 12)).pack(side="left", padx=4)
-        ctk.CTkLabel(hdr, text=tag_text,
-                      text_color="#FFE680", font=("", 12, "bold")).pack(
-            side="right", padx=14)
+    @staticmethod
+    def _candidate_delta_text(candidate) -> str:
+        if not candidate:
+            return ""
+        _code, _si, _so, d_in, d_out, _h = candidate
+        parts: list[str] = []
+        if d_in > 0:
+            parts.append(f"早到{d_in}分")
+        if d_out > 0:
+            parts.append(f"晚下{d_out}分")
+        elif d_out < 0:
+            parts.append(f"早退{-d_out}分")
+        return " / ".join(parts)
 
-        # ── 應排班 vs 實際打卡 ────────────────────────────────
-        info = ctk.CTkFrame(outer, fg_color="transparent")
-        info.pack(fill="x", padx=10, pady=(8, 4))
+    def _default_suggestion_kind(self, emp_id: str, date: str, shift_code: str) -> int:
+        kind = 3 if _is_rest(shift_code) else 1
+        for emp in (self.schedule or []):
+            if emp.emp_id != emp_id:
+                continue
+            existing = emp.shift_on(date)
+            if existing is not None and existing.kind is not None:
+                return existing.kind
+            break
+        return kind
 
-        cur_f = ctk.CTkFrame(info, fg_color="#FFF4EE", corner_radius=8,
-                              border_width=1, border_color="#FDDDC9")
-        cur_f.pack(side="left", fill="both", expand=True, padx=(0, 4))
-        ctk.CTkLabel(cur_f, text="應排班",
-                      text_color=_C["muted"], font=("", 11)).pack(
-            anchor="w", padx=10, pady=(8, 0))
-        ctk.CTkLabel(cur_f, text=shift_code or "—",
-                      text_color=_C["accent"], font=("", 15, "bold")).pack(
-            anchor="w", padx=10)
-        code_name = self.shift_codes.get(shift_code, ("", 3))[0] if shift_code else ""
-        ctk.CTkLabel(cur_f, text=code_name or f"{sched_in}–{sched_out}",
-                      font=("", 11), text_color=_C["ink"]).pack(anchor="w", padx=10)
-        if shift_code or (sched_in and sched_out):
-            disp_h = _shift_hours(shift_code) or (
-                _calc_hours(sched_in, sched_out) if sched_in and sched_out else 0.0)
-            if disp_h:
-                ctk.CTkLabel(cur_f, text=f"{disp_h:g}h",
-                              text_color=_C["muted"]).pack(
-                    anchor="w", padx=10, pady=(0, 8))
+    def _render_suggestions(self, select_id: str | None = None) -> None:
+        if not hasattr(self, "suggest_table"):
+            return
+        mode = self.suggest_type_var.get() if hasattr(self, "suggest_type_var") else "全部"
+        rows = list(self._suggestion_rows)
+        if mode == "遲到早退":
+            rows = [r for r in rows if r["type"] == "遲到早退"]
+        elif mode == "加班":
+            rows = [r for r in rows if r["type"] == "加班"]
+        self.suggest_count_lbl.configure(text=f"共 {len(rows)} 筆")
+        self.suggest_table.populate(rows)
+        row_ids = {r["id"] for r in rows}
+        selected = select_id if select_id in row_ids else None
+        if not selected and self._current_suggestion_id in row_ids:
+            selected = self._current_suggestion_id
+        if not selected:
+            selected = self.suggest_table.first_id()
+        if selected:
+            self.suggest_table.select(selected)
+        else:
+            self._current_suggestion_id = None
+            self._clear_suggestion_detail("目前篩選條件下沒有可處理的建議")
 
-        act_f = ctk.CTkFrame(info, fg_color="#EEF4FF", corner_radius=8,
-                              border_width=1, border_color="#CCDDFF")
-        act_f.pack(side="left", fill="both", expand=True, padx=(4, 0))
-        ctk.CTkLabel(act_f, text="實際打卡",
-                      text_color=_C["muted"], font=("", 11)).pack(
-            anchor="w", padx=10, pady=(8, 0))
-        punch_txt = (f"{clock_in}  →  {clock_out}"
-                     if clock_in and clock_out else clock_in or clock_out or "—")
-        ctk.CTkLabel(act_f, text=punch_txt,
-                      font=("", 14, "bold"), text_color=_C["ink"]).pack(
-            anchor="w", padx=10, pady=(4, 8))
+    def _clear_suggestion_detail(self, text: str) -> None:
+        for w in self.suggest_detail.winfo_children():
+            w.destroy()
+        ctk.CTkLabel(
+            self.suggest_detail, text=text, text_color=_C["muted"],
+            font=("", 13), wraplength=300, justify="center"
+        ).pack(expand=True, padx=18, pady=28)
 
-        # ── 排班日種類選擇（一張卡共用，所有套用按鈕均沿用） ──────
-        # 預設：991 系列 → 3(排休)，其他 → 1(工作日)；若已有班則取其 kind。
-        _default_k = 3 if _is_rest(shift_code) else 1
-        for _emp_obj in (self.schedule or []):
-            if _emp_obj.emp_id == emp_id:
-                _ex = _emp_obj.shift_on(date)
-                if _ex is not None and _ex.kind is not None:
-                    _default_k = _ex.kind
-                break
-        kind_var = tk.IntVar(value=_default_k)
-        kind_bar = ctk.CTkFrame(outer, fg_color=_C["tab_bg"], corner_radius=8)
-        kind_bar.pack(fill="x", padx=12, pady=(0, 4))
-        ctk.CTkLabel(kind_bar, text="排班日種類：",
-                      text_color=_C["ink"], font=("", 11)
-                      ).pack(side="left", padx=(10, 6), pady=5)
-        for _lbl, _val in [("工作日 (1)", 1), ("排休 (3)", 3)]:
-            ctk.CTkRadioButton(kind_bar, text=_lbl, variable=kind_var, value=_val,
-                                text_color=_C["ink"], font=("", 11)
-                                ).pack(side="left", padx=8, pady=5)
+    def _show_suggestion_detail(self, row: dict | None) -> None:
+        if not row:
+            self._clear_suggestion_detail("目前篩選條件下沒有可處理的建議")
+            return
+        self._current_suggestion_id = row["id"]
+        for w in self.suggest_detail.winfo_children():
+            w.destroy()
 
-        # ── 建議班別 ─────────────────────────────────────────
-        if not sugg:
-            ctk.CTkLabel(outer, text="找不到合適的班別建議",
-                          text_color=_C["muted"]).pack(pady=8)
-        for i, (code, si, so, d_in, d_out, h) in enumerate(sugg):
-            row_bg = _C["row_alt"] if i % 2 == 0 else _C["white"]
-            row = ctk.CTkFrame(outer, fg_color=row_bg, corner_radius=6)
-            row.pack(fill="x", padx=8, pady=2)
+        ctk.CTkLabel(
+            self.suggest_detail,
+            text=f"{row['name']}  {row['emp_id']}",
+            text_color=_C["ink"], font=("", 15, "bold")
+        ).pack(anchor="w", padx=14, pady=(14, 2))
+        ctk.CTkLabel(
+            self.suggest_detail,
+            text=f"{row['date']}  {row['remark']}  /  {row['status']}",
+            text_color=_C["muted"], font=("", 12)
+        ).pack(anchor="w", padx=14, pady=(0, 10))
+        if row.get("error"):
+            ctk.CTkLabel(
+                self.suggest_detail, text=row["error"], text_color=_C["red"],
+                wraplength=310, justify="left"
+            ).pack(anchor="w", padx=14, pady=(0, 8))
 
-            rank_txt = "★" if i == 0 else str(i + 1)
-            ctk.CTkLabel(row, text=rank_txt, width=24,
-                          text_color="#D08000" if i == 0 else _C["muted"],
-                          font=("", 13, "bold")).pack(side="left", padx=6, pady=5)
+        summary = ctk.CTkFrame(self.suggest_detail, fg_color=_C["tab_bg"],
+                               corner_radius=8)
+        summary.pack(fill="x", padx=12, pady=(0, 10))
+        for label, value in [
+            ("原班別", row["current_shift"]),
+            ("表定", row["scheduled"]),
+            ("實際", row["actual"]),
+            ("差異", row["delta"] or "—"),
+        ]:
+            line = ctk.CTkFrame(summary, fg_color="transparent")
+            line.pack(fill="x", padx=10, pady=2)
+            ctk.CTkLabel(line, text=label, width=52, anchor="w",
+                          text_color=_C["muted"], font=("", 11)).pack(side="left")
+            ctk.CTkLabel(line, text=value, anchor="w",
+                          text_color=_C["ink"], font=("", 12, "bold")).pack(side="left")
 
-            s_name = self.shift_codes.get(code, ("", 3))[0]
-            ctk.CTkLabel(row, text=f"{code}  {s_name or f'{si}–{so}'}",
-                          width=210, anchor="w",
-                          text_color=_C["ink"]).pack(side="left", padx=4)
-            ctk.CTkLabel(row, text=f"{h:g}h",
-                          width=36, text_color=_C["muted"]).pack(side="left")
+        self.suggest_kind_var = tk.IntVar(value=row.get("kind", 1))
+        kind_bar = ctk.CTkFrame(self.suggest_detail, fg_color=_C["white"],
+                                corner_radius=8, border_width=1,
+                                border_color=_C["line"])
+        kind_bar.pack(fill="x", padx=12, pady=(0, 10))
+        ctk.CTkLabel(kind_bar, text="排班日種類",
+                      text_color=_C["ink"], font=("", 12, "bold")).pack(
+            anchor="w", padx=10, pady=(8, 2))
+        for label, value in [("工作日 (1)", 1), ("排休 (3)", 3)]:
+            ctk.CTkRadioButton(
+                kind_bar, text=label, variable=self.suggest_kind_var,
+                value=value, text_color=_C["ink"], font=("", 12)
+            ).pack(anchor="w", padx=10, pady=3)
 
-            parts: list[str] = []
-            if d_in > 0:
-                parts.append(f"早{d_in}分")
-            if d_out > 0:
-                parts.append(f"晚{d_out}分")
-            elif d_out < 0:
-                parts.append(f"早退{-d_out}分")
-            ctk.CTkLabel(row, text="·".join(parts),
-                          text_color="#D07000", width=110).pack(side="left", padx=4)
+        ctk.CTkLabel(
+            self.suggest_detail, text="候選班別", text_color=_C["ink"],
+            font=("", 13, "bold")
+        ).pack(anchor="w", padx=14, pady=(2, 4))
 
+        if not row["candidates"]:
+            ctk.CTkLabel(
+                self.suggest_detail, text="無合適建議",
+                text_color=_C["muted"]
+            ).pack(anchor="w", padx=14, pady=8)
+            return
+
+        for i, candidate in enumerate(row["candidates"]):
+            code, si, so, d_in, d_out, h = candidate
+            name = row["shift_names"].get(code, "")
+            card = ctk.CTkFrame(
+                self.suggest_detail,
+                fg_color=_C["row_alt"] if i % 2 == 0 else _C["white"],
+                corner_radius=8, border_width=1, border_color=_C["line"]
+            )
+            card.pack(fill="x", padx=12, pady=3)
+            top = ctk.CTkFrame(card, fg_color="transparent")
+            top.pack(fill="x", padx=10, pady=(8, 2))
+            ctk.CTkLabel(
+                top, text=f"{'最佳 ' if i == 0 else ''}{code}",
+                text_color=_C["accent"], font=("", 13, "bold")
+            ).pack(side="left")
+            ctk.CTkLabel(
+                top, text=f"{h:g}h", text_color=_C["muted"],
+                font=("", 12)
+            ).pack(side="right")
+            ctk.CTkLabel(
+                card, text=name or f"{si}-{so}", text_color=_C["ink"],
+                anchor="w", wraplength=260
+            ).pack(anchor="w", padx=10)
+            ctk.CTkLabel(
+                card, text=self._candidate_delta_text(candidate) or "時間吻合",
+                text_color="#D07000", font=("", 11)
+            ).pack(anchor="w", padx=10, pady=(0, 6))
             ctk.CTkButton(
-                row, text="套用", width=60, height=28,
+                card, text="套用此班", height=28,
                 fg_color=_C["accent"], hover_color=_C["acc_h"],
-                corner_radius=6, font=("", 12),
-                command=lambda eid=emp_id, dt=date, c=code, kv=kind_var: self._apply_suggestion(eid, dt, c, kv.get())
-            ).pack(side="right", padx=8, pady=5)
+                corner_radius=6,
+                command=lambda rid=row["id"], c=candidate: self._apply_suggestion_candidate(
+                    rid, c, self.suggest_kind_var.get()
+                )
+            ).pack(fill="x", padx=10, pady=(0, 8))
+
+    def _apply_best_suggestion(self, row_id: str) -> None:
+        row = self._suggestion_by_id.get(row_id)
+        if not row or not row.get("best_candidate"):
+            return
+        kind = getattr(self, "suggest_kind_var", tk.IntVar(value=row.get("kind", 1))).get()
+        self._apply_suggestion_candidate(row_id, row["best_candidate"], kind)
+
+    def _apply_suggestion_candidate(self, row_id: str, candidate, kind: int) -> None:
+        row = self._suggestion_by_id.get(row_id)
+        if not row or not candidate or not self._need_client():
+            return
+        code = candidate[0]
+        row["kind"] = kind
+        row["status"] = "套用中"
+        row["error"] = ""
+        self._render_suggestions(select_id=row_id)
+        year, month, _ = (int(x) for x in row["date"].split("-"))
+        self._set_status(f"套用中：{row['emp_id']} {row['date']} → {code}（日種類={kind}）…")
+
+        def work():
+            return self.client.set_shift(
+                year, month, row["emp_id"], row["date"], code,
+                kind=kind, dry_run=False,
+            )
+
+        def done(_):
+            row["status"] = "已套用"
+            row["error"] = ""
+            self._set_status(f"已套用：{row['emp_id']} {row['date']} → {code}")
+            self._render_suggestions(select_id=row_id)
+            self._load_schedule()
+
+        def failed(exc: Exception):
+            row["status"] = "失敗"
+            row["error"] = str(exc)
+            self._set_status(f"套用失敗：{exc}")
+            self._render_suggestions(select_id=row_id)
+            messagebox.showerror("套用失敗", str(exc))
+
+        self._run_async(work, done, on_error=failed)
 
     def _apply_suggestion(self, emp_id: str, date_str: str, code: str, kind: int = 1) -> None:
         if not self._need_client():
