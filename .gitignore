@@ -19,3 +19,6 @@ __pycache__/
 .idea/
 .vscode/
 install.command
+
+# JVM crash log（非本專案產物）
+hs_err_pid*.log

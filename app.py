@@ -13,7 +13,6 @@ import re
 import threading
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
 from itertools import groupby
 from tkinter import messagebox, ttk
 
@@ -25,37 +24,50 @@ import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from config import load_config, save_config
-from ehrs_client import DEFAULT_BASE_URL, EhrsClient
+from ehrs_client import DEFAULT_BASE_URL, EhrsClient, Shift
 from shift_codes_ref import SHIFT_CODES_REF
 from version import __version__
+from punch_logic import (
+    _DEPT_CODE_KEYS,
+    _DEPT_FULL_KEYS,
+    _DEPT_KEYS,
+    _DEPT_NAME_KEYS,
+    _EMP_ID_KEYS,
+    _EMP_NAME_KEYS,
+    _REMARK_ERR_KEYWORDS,
+    _REMARK_OT_KEYWORD,
+    _assign_single_punch,
+    _calc_hours,
+    _classify_remark,
+    _deduct_break,
+    _first_field,
+    _get_schedule_periods,
+    _is_rest,
+    _overtime_hours,
+    _punch_mins,
+    _punch_remark,
+    _shift_hours,
+    _shift_times,
+    _split_punches,
+    _split_punches_jiezhuan,
+    _suggest_shifts,
+)
+from widgets import (
+    _C,
+    _PunchTable,
+    _ScheduleGrid,
+    _ScheduleHeader,
+    _SuggestionTable,
+    _bind_mousewheel,
+    _bind_scrollable_frame_mousewheel,
+    _wheel_axis,
+    _wheel_units,
+)
 
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
-# ─── UI 色彩字典（參考 HTML 設計稿配色）────────────────────────────────────────
-_C = {
-    "accent":  "#4A6FE3",   # 主色：靛藍
-    "acc_h":   "#3B5DD0",   # 主色 hover
-    "ink":     "#2D3048",   # 主文字：深藍灰
-    "muted":   "#7B8097",   # 次文字：中灰
-    "app_bg":  "#F5F7FB",   # 應用底色：極淡藍灰
-    "tab_bg":  "#ECEEF5",   # 分頁列容器
-    "line":    "#E8EBF4",   # 邊框 / 分隔線
-    "white":   "#FFFFFF",
-    "tbl_hdr": "#EEF2FB",   # 表格表頭
-    "row_alt": "#F8F9FD",   # 隔行底色
-    "red":     "#CC2200",
-    "green":   "#2A8B5A",
-}
-
-_WEEK = "一二三四五六日"
 _EXCEL_SHEET_BAD_CHARS = re.compile(r"[\[\]\*\?/\\:]")
-_DEPT_KEYS = ("部門名稱", "部門", "部門全名", "pa51014FullName", "pa51014Name")
-_DEPT_CODE_KEYS = ("部門代號", "pa51014")
-_DEPT_FULL_KEYS = ("部門全名", "pa51014FullName")
-_DEPT_NAME_KEYS = ("部門名稱", "部門", "pa51014Name")
-_EMP_ID_KEYS = ("員工代號", "pa51002")
-_EMP_NAME_KEYS = ("員工姓名", "pa51004")
 _W_BTN = 86
 _W_FILTER = 112
 _W_PRIMARY = 124
@@ -65,760 +77,6 @@ def _excel_sheet_title(title: str) -> str:
     """Return a valid Excel worksheet title."""
     cleaned = _EXCEL_SHEET_BAD_CHARS.sub("-", title).strip().strip("'")
     return (cleaned or "Sheet")[:31]
-
-
-def _first_field(row: dict, keys: tuple[str, ...]) -> str:
-    for key in keys:
-        value = row.get(key)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    return ""
-
-
-def _get_schedule_periods(roc_year: int) -> list[tuple[dt.date, dt.date]]:
-    """計算指定民國年度的 14 個四週排班期間（每期 28 天）。
-    民國 115 年基準起始日：2025-12-22（週一）。
-    相鄰年度以 ±52 週（364 天）近似推算，維持週一起始。
-    回傳 [(start, end), ...] × 14。
-    """
-    _ANCHOR_ROC  = 115
-    _ANCHOR_DATE = dt.date(2025, 12, 22)
-    diff   = roc_year - _ANCHOR_ROC
-    anchor = _ANCHOR_DATE + dt.timedelta(weeks=52 * diff)
-    return [
-        (anchor + dt.timedelta(days=28 * i),
-         anchor + dt.timedelta(days=28 * i + 27))
-        for i in range(14)
-    ]
-
-
-def _is_rest(code: str) -> bool:
-    """排休班別判斷：991 及 991-x 開頭的都算排休。"""
-    return bool(code) and code.startswith("991")
-
-
-@lru_cache(maxsize=None)
-def _shift_times(code: str) -> tuple[str, str]:
-    """從 SHIFT_CODES_REF 解析班別的表定上班/下班時間（HH:MM）。
-    SHIFT_CODES_REF 為唯讀常數,輸入班別代碼有限,故以 lru_cache 快取(熱路徑)。"""
-    name = SHIFT_CODES_REF.get(code, ("", 3, 0.0))[0]
-    m = re.search(r"(\d{2}:\d{2})-(\d{2}:\d{2})", name)
-    return (m.group(1), m.group(2)) if m else ("", "")
-
-
-@lru_cache(maxsize=None)
-def _shift_hours(code: str) -> float:
-    """從 SHIFT_CODES_REF 直接取得班別時數（已含休息扣除）。"""
-    return SHIFT_CODES_REF.get(code, ("", 3, 0.0))[2]
-
-
-def _punch_mins(t: str) -> int:
-    h, m = t.split(":")
-    return int(h) * 60 + int(m)
-
-
-def _split_punches(punches: list[str], sched_in: str, sched_out: str) -> tuple[str, str]:
-    """多筆打卡依距表定時間分為上班群/下班群，取上班群最早、下班群最晚。
-    無排班資料時直接取第一筆和最後一筆。"""
-    if not sched_in or not sched_out:
-        return punches[0], punches[-1]
-    si = _punch_mins(sched_in)
-    so = _punch_mins(sched_out)
-    if so < si:
-        so += 1440
-    in_grp, out_grp = [], []
-    for p in punches:
-        pm = _punch_mins(p)
-        if pm < si - 120:
-            pm += 1440
-        (out_grp if abs(pm - so) <= abs(pm - si) else in_grp).append(p)
-    return (in_grp[0] if in_grp else ""), (out_grp[-1] if out_grp else "")
-
-
-def _split_punches_jiezhuan(punches: list[str], sched_in: str, sched_out: str) -> tuple[str, str]:
-    """結轉打卡專用分群：不做 2 小時截斷，直接以距表定時間近遠判斷上/下班。
-    支援跨夜班（凌晨打卡加 1440 修正）。"""
-    if not sched_in or not sched_out:
-        return punches[0], punches[-1]
-    si = _punch_mins(sched_in)
-    so = _punch_mins(sched_out)
-    cross = so < si
-    if cross:
-        so += 1440   # 跨夜班：把下班時間加一天
-    in_grp, out_grp = [], []
-    for p in punches:
-        pm = _punch_mins(p)
-        # 跨夜班：凌晨打卡若距上班超過 6 小時，視為隔天
-        if cross and pm < si - 360:
-            pm += 1440
-        (out_grp if abs(pm - so) <= abs(pm - si) else in_grp).append(p)
-    return (in_grp[0] if in_grp else ""), (out_grp[-1] if out_grp else "")
-
-
-def _overtime_hours(clock_in: str, clock_out: str, sched_in: str, sched_out: str,
-                    kind: int | None = None) -> float:
-    """加班 / 休息日加班時數(四捨五入至 0.5h);無加班回 0.0。
-    為「備注字串」與「出勤統計」共用的單一計算來源(避免從字串反解)。"""
-    # 休息日(kind=2):工作全程即加班
-    if kind == 2:
-        if not (clock_in and clock_out and sched_in and sched_out):
-            return 0.0
-        ci = _punch_mins(clock_in)
-        co = _punch_mins(clock_out)
-        if co < ci:
-            co += 1440   # 跨夜
-        worked = co - ci
-        return round(worked / 60 * 2) / 2 if worked > 0 else 0.0
-    # 一般工作日:下班超過表定 30 分才算加班(以打卡下班為準)
-    if not (clock_out and sched_in and sched_out):
-        return 0.0
-    si = _punch_mins(sched_in)
-    so = _punch_mins(sched_out)
-    co = _punch_mins(clock_out)
-    if so < si:
-        so += 1440
-    if co < si - 120:
-        co += 1440
-    if co > so + 30:
-        return round((co - so) / 60 * 2) / 2
-    return 0.0
-
-
-def _punch_remark(clock_in: str, clock_out: str, sched_in: str, sched_out: str,
-                  kind: int | None = None) -> str:
-    """產生備注文字：遲到、早退、上班忘打卡、下班忘打卡、加班（可複合）。
-    kind=2 休息日：有打卡即算「休息日加班 Xh」，不另做遲到/早退判斷。
-    """
-    remarks: list[str] = []
-
-    # ── 休息日（kind=2）：只要有打卡就是加班 ──────────────────────
-    if kind == 2:
-        oh = _overtime_hours(clock_in, clock_out, sched_in, sched_out, kind=2)
-        if oh > 0:
-            remarks.append(f"休息日加班{oh:g}h")
-        elif clock_in:
-            remarks.append("休息日加班")
-        return " ".join(remarks)
-
-    # ── 一般工作日 ─────────────────────────────────────────────────
-    if not clock_in:
-        remarks.append("上班忘打卡")
-    elif sched_in and _punch_mins(clock_in) > _punch_mins(sched_in):
-        remarks.append("遲到")
-    if not clock_out:
-        remarks.append("下班忘打卡")
-    elif sched_out and sched_in:
-        si = _punch_mins(sched_in)
-        so = _punch_mins(sched_out)
-        co = _punch_mins(clock_out)
-        if so < si:
-            so += 1440
-        if co < si - 120:
-            co += 1440
-        if co < so:
-            remarks.append("早退")
-        elif co > so + 30:                           # 超過 30 分鐘算加班
-            oh = _overtime_hours(clock_in, clock_out, sched_in, sched_out, kind=kind)
-            remarks.append(f"加班{oh:g}h")
-    return " ".join(remarks)
-
-
-# 備注分類所用關鍵字(集中一處,供 _classify_remark 與各分頁共用)
-_REMARK_ERR_KEYWORDS = ("遲到", "上班忘打卡", "早退", "下班忘打卡", "曠職")
-_REMARK_OT_KEYWORD = "加班"   # 含「加班」「休息日加班」
-
-
-def _classify_remark(remark: str) -> str:
-    """把備注歸成單一類別:'err'(異常) / 'ot'(加班) / 'leave'(假別) / ''(正常)。
-    優先序 err > ot > leave。打卡分頁著色、篩選、統計、建議共用此判斷。"""
-    remark = remark or ""
-    if not remark:
-        return ""
-    if any(k in remark for k in _REMARK_ERR_KEYWORDS):
-        return "err"
-    if _REMARK_OT_KEYWORD in remark:
-        return "ot"
-    return "leave"
-
-
-def _calc_hours(sched_in: str, sched_out: str) -> float:
-    """計算實際工時（扣除休息）。
-    ≤ 4h：不扣；> 4h 且 < 9h：扣 0.5h；≥ 9h：扣 1h。"""
-    si = _punch_mins(sched_in)
-    so = _punch_mins(sched_out)
-    if so < si:
-        so += 1440
-    total = (so - si) / 60.0
-    if total <= 4.0:
-        return total
-    return total - (1.0 if total >= 9.0 else 0.5)
-
-
-def _suggest_shifts(
-    clock_in: str, clock_out: str, shift_codes: dict,
-    preferred_hours: float = 8.0, top_n: int = 3
-) -> list[tuple]:
-    """找最適班別：實際打卡時間不會造成遲到/早退的班別 top_n 名。
-    排序規則：工時差距最小優先（同工時 → 時間最接近）。
-    回傳 [(code, sched_in, sched_out, delta_in, delta_out, hours), ...]
-    delta_in > 0 = 比排班提早到；delta_out > 0 = 比排班晚下班（加班）。
-    """
-    ci_m = _punch_mins(clock_in) if clock_in else None
-    co_m = _punch_mins(clock_out) if clock_out else None
-    if ci_m is None and co_m is None:
-        return []
-    candidates = []
-    for code in shift_codes:
-        if _is_rest(code):
-            continue
-        si, so = _shift_times(code)
-        if not si or not so:
-            continue
-        si_m = _punch_mins(si)
-        so_m = _punch_mins(so)
-        if so_m < si_m:
-            so_m += 1440
-        ci_a = (ci_m + 1440) if ci_m is not None and ci_m < si_m - 240 else ci_m
-        co_a = (co_m + 1440) if co_m is not None and co_m < si_m - 240 else co_m
-        d_in  = (si_m - ci_a) if ci_a is not None else 0   # + = 早到
-        d_out = (co_a - so_m) if co_a is not None else 0   # + = 加班
-        if ci_a is not None and (d_in < 0 or d_in > 120):
-            continue
-        if co_a is not None and d_out < -5:
-            continue
-        h = _shift_hours(code) or _calc_hours(si, so)
-        # 主要：工時差距（相差 0.5h = +1000 分）；次要：時間契合度
-        score = abs(h - preferred_hours) * 1000 + d_in * 0.7 + max(0, d_out) * 0.5
-        candidates.append((code, si, so, d_in, d_out, h, score))
-    candidates.sort(key=lambda x: x[6])
-    return [(c, si, so, d_in, d_out, h)
-            for c, si, so, d_in, d_out, h, _ in candidates[:top_n]]
-
-
-def _assign_single_punch(punch: str, sched_in: str, sched_out: str) -> tuple[str, str]:
-    """只有一筆打卡時，依距表定上班/下班的近遠判斷是實際上班還是實際下班。
-    回傳 (實際上班, 實際下班)，其中一個為空字串。"""
-    if not sched_in and not sched_out:
-        return punch, ""
-    p = _punch_mins(punch)
-    if sched_in and sched_out:
-        si = _punch_mins(sched_in)
-        so = _punch_mins(sched_out)
-        if so < si:
-            so += 1440
-        if p < si - 120:
-            p += 1440
-        return ("", punch) if abs(p - so) <= abs(p - si) else (punch, "")
-    return ("", punch) if sched_out else (punch, "")
-
-
-_WHEEL_ACTIVE_TARGET = None
-_WHEEL_ACTIVE_WIDGET = None
-_WHEEL_BOUND = False
-
-
-def _wheel_units(event) -> int:
-    """把滾輪 / 觸控板事件換算成 yview_scroll 的 units（負值=往上）。
-    跨平台：
-      - macOS：delta 為小整數（±1、±2…），直接當單位數，不可除以 120/60。
-      - Windows：delta 為 ±120 的倍數。
-      - Linux/X11：無 delta，改用 Button-4（上）/ Button-5（下）。"""
-    d = getattr(event, "delta", 0)
-    if d:
-        if abs(d) >= 120:                       # Windows / 部分 X11
-            return int(-d / 120) or (-1 if d > 0 else 1)
-        return -d                                # macOS：delta 已是單位數
-    num = getattr(event, "num", 0)
-    if num == 4:
-        return -1
-    if num == 5:
-        return 1
-    if num == 6:
-        return -1
-    if num == 7:
-        return 1
-    return 0
-
-
-def _wheel_axis(event) -> str:
-    """判斷滾輪事件要導向垂直或水平捲動。"""
-    num = getattr(event, "num", 0)
-    if num in (6, 7):
-        return "x"
-    # Tk 在多數平台把水平滾輪/觸控板事件映射成 Shift-MouseWheel。
-    if getattr(event, "state", 0) & 0x0001:
-        return "x"
-    return "y"
-
-
-def _scroll_target(target, event) -> bool:
-    n = _wheel_units(event)
-    if not n:
-        return False
-    axis = _wheel_axis(event)
-    try:
-        if axis == "x" and hasattr(target, "xview_scroll"):
-            target.xview_scroll(n, "units")
-        elif axis == "x" and hasattr(target, "xview"):
-            target.xview("scroll", n, "units")
-        elif hasattr(target, "yview_scroll"):
-            target.yview_scroll(n, "units")
-        else:
-            target.yview("scroll", n, "units")
-    except Exception:
-        return False
-    return True
-
-
-def _bind_mousewheel(widget, target=None) -> None:
-    """讓 widget 區域內的上下滾輪/觸控板捲動 target（預設為 widget 本身）。
-
-    為何用全域 active target 而非每個 widget 都 bind_all / unbind_all：
-    在 macOS + CustomTkinter 的巢狀版面中，滾輪事件不一定會送達被捲動的
-    那個 widget（可能落到外層 CTk frame），導致只有少數頁面能捲。改採
-    「全域只綁一次，指標進入時切換目前 target」的做法，避免離開某個表格時
-    unbind_all 清掉 CustomTkinter 自己的觸控板捲動綁定。
-    跨平台：macOS delta 為小整數、Windows 為 ±120 倍數、Linux 用 Button-4/5。
-    也支援 Shift/水平滾輪導向 xview_scroll。"""
-    global _WHEEL_BOUND
-    tgt = target if target is not None else widget
-
-    def _handler(event):
-        if _scroll_target(tgt, event):
-            return "break"
-        return None
-
-    def _global_handler(event):
-        if _WHEEL_ACTIVE_TARGET is None:
-            return None
-        if _scroll_target(_WHEEL_ACTIVE_TARGET, event):
-            return "break"
-        return None
-
-    def _on_enter(_e):
-        global _WHEEL_ACTIVE_TARGET, _WHEEL_ACTIVE_WIDGET
-        _WHEEL_ACTIVE_TARGET = tgt
-        _WHEEL_ACTIVE_WIDGET = widget
-
-    def _on_leave(_e):
-        global _WHEEL_ACTIVE_TARGET, _WHEEL_ACTIVE_WIDGET
-        if _WHEEL_ACTIVE_WIDGET is widget:
-            _WHEEL_ACTIVE_TARGET = None
-            _WHEEL_ACTIVE_WIDGET = None
-
-    def _safe_bind(seq: str, callback, *, bind_all: bool = False) -> None:
-        try:
-            if bind_all:
-                widget.bind_all(seq, callback, add="+")
-            else:
-                widget.bind(seq, callback)
-        except tk.TclError:
-            # 部分 Tk build 不支援 Button-6/7；略過即可，垂直捲動仍可用。
-            pass
-
-    if not _WHEEL_BOUND:
-        for seq in (
-            "<MouseWheel>", "<Shift-MouseWheel>",
-            "<Button-4>", "<Button-5>", "<Button-6>", "<Button-7>",
-        ):
-            _safe_bind(seq, _global_handler, bind_all=True)
-        _WHEEL_BOUND = True
-
-    # 直接綁在 widget 上作為後備（事件確實送達時即可用）
-    for seq in (
-        "<MouseWheel>", "<Shift-MouseWheel>",
-        "<Button-4>", "<Button-5>", "<Button-6>", "<Button-7>",
-    ):
-        _safe_bind(seq, _handler)
-    # 指標進入/離開時切換 app 層級綁定，涵蓋事件未直接送達 widget 的情況
-    widget.bind("<Enter>", _on_enter)
-    widget.bind("<Leave>", _on_leave)
-
-
-def _bind_scrollable_frame_mousewheel(scrollable) -> None:
-    """補強 CTkScrollableFrame 的觸控板/滾輪事件，不覆蓋 CTk 內建綁定。"""
-    target = (
-        getattr(scrollable, "_parent_canvas", None)
-        or getattr(scrollable, "_canvas", None)
-        or scrollable
-    )
-    _bind_mousewheel(scrollable, target=target)
-
-
-class _ScheduleHeader(tk.Canvas):
-    """自訂雙排表頭：上列顯示月/日，下列顯示星期，六日紅字底色。
-    與排班 Treeview 水平捲動同步（由外部呼叫 sync_x）。"""
-    DATE_H  = 22
-    WD_H    = 18
-    TOTAL_H = DATE_H + WD_H   # 40 px
-    EMP_W   = 150
-    HOURS_W = 60    # 總時數欄
-    COL_W   = 52
-    _BG     = "#EEF2FB"
-    _WKBG   = "#FFF0F0"   # 六日背景
-    _GRID   = "#E8EBF4"
-    _INK    = "#2D3048"
-    _RED    = "#CC2200"   # 六日文字
-
-    def __init__(self, parent, **kw):
-        kw.setdefault("highlightthickness", 0)
-        kw.setdefault("bd", 0)
-        kw.setdefault("bg", self._BG)
-        kw.setdefault("height", self.TOTAL_H)
-        super().__init__(parent, **kw)
-        self._dates: list[dt.date] = []
-
-    def set_dates(self, dates: list[dt.date]) -> None:
-        self._dates = list(dates)
-        self._redraw()
-
-    def sync_x(self, first, *_) -> None:
-        """由 Treeview xscrollcommand 呼叫，同步水平捲動位置。"""
-        self.xview_moveto(first)
-
-    def _redraw(self) -> None:
-        self.delete("all")
-        dates   = self._dates
-        total_w = self.EMP_W + self.HOURS_W + self.COL_W * len(dates)
-        self.configure(scrollregion=(0, 0, total_w, self.TOTAL_H))
-
-        # 員工欄（跨兩排高度）
-        self.create_rectangle(0, 0, self.EMP_W, self.TOTAL_H,
-                               fill=self._BG, outline=self._GRID)
-        self.create_text(self.EMP_W // 2, self.TOTAL_H // 2,
-                         text="員工",
-                         font=("TkDefaultFont", 12, "bold"),
-                         fill=self._INK, anchor="center")
-
-        # 時數欄（跨兩排高度）
-        hx = self.EMP_W
-        self.create_rectangle(hx, 0, hx + self.HOURS_W, self.TOTAL_H,
-                               fill=self._BG, outline=self._GRID)
-        self.create_text(hx + self.HOURS_W // 2, self.TOTAL_H // 2,
-                         text="時數",
-                         font=("TkDefaultFont", 12, "bold"),
-                         fill=self._INK, anchor="center")
-
-        for i, d in enumerate(dates):
-            x0 = self.EMP_W + self.HOURS_W + i * self.COL_W
-            x1 = x0 + self.COL_W
-            is_wkend = d.weekday() >= 5   # 5=Sat, 6=Sun
-            bg = self._WKBG if is_wkend else self._BG
-            fg = self._RED  if is_wkend else self._INK
-
-            # 上列：月/日
-            self.create_rectangle(x0, 0, x1, self.DATE_H,
-                                   fill=bg, outline=self._GRID)
-            self.create_text((x0 + x1) // 2, self.DATE_H // 2,
-                             text=f"{d.month}/{d.day}",
-                             font=("TkDefaultFont", 11, "bold"),
-                             fill=fg, anchor="center")
-
-            # 下列：星期
-            self.create_rectangle(x0, self.DATE_H, x1, self.TOTAL_H,
-                                   fill=bg, outline=self._GRID)
-            self.create_text((x0 + x1) // 2,
-                             self.DATE_H + self.WD_H // 2,
-                             text=_WEEK[d.weekday()],
-                             font=("TkDefaultFont", 11),
-                             fill=fg, anchor="center")
-
-
-class _ScheduleGrid(tk.Frame):
-    """Canvas-based schedule grid；kind=3（排休）顯示紅字。"""
-    ROW_H   = 26
-    EMP_W   = 150
-    HOURS_W = 60
-    COL_W   = 52
-    FONT    = ("TkDefaultFont", 11)
-    BG      = ("#FFFFFF", "#F8F9FD")
-    GRID_C  = "#E8EBF4"
-    INK     = "#2D3048"
-    REST_FG = "#CC2200"   # kind=3 排休紅字
-
-    def __init__(self, parent, on_double=None, **kw):
-        super().__init__(parent, **kw)
-        self._on_double = on_double          # callback(emp_obj, col_idx)
-        self._rows: list = []                # [(emp, values_list, kinds_list)]
-        self._dates: list = []
-
-        self._cv = tk.Canvas(self, bg="#FFFFFF", highlightthickness=0)
-        # 設定捲動單位=列高,讓滾輪/觸控板一格捲一列(預設 0 會導致幾乎不動)
-        self._cv.configure(yscrollincrement=self.ROW_H)
-        self._cv.grid(row=0, column=0, sticky="nsew")
-        self.rowconfigure(0, weight=1)
-        self.columnconfigure(0, weight=1)
-
-        _bind_mousewheel(self._cv)
-        self._cv.bind("<Double-Button-1>", self._handle_double)
-
-    # ── 對外 scroll API（接替 ttk.Treeview） ──────────────────────────────
-    def configure(self, **kw):
-        ys = kw.pop("yscrollcommand", None)
-        xs = kw.pop("xscrollcommand", None)
-        if ys: self._cv.configure(yscrollcommand=ys)
-        if xs: self._cv.configure(xscrollcommand=xs)
-        if kw: super().configure(**kw)
-
-    def yview(self, *a): self._cv.yview(*a)
-    def xview(self, *a): self._cv.xview(*a)
-    def xview_moveto(self, f): self._cv.xview_moveto(f)
-
-    # ── 填充資料 ──────────────────────────────────────────────────────────
-    def populate(self, dates: list, emp_rows: list) -> None:
-        """
-        dates    : list[dt.date]
-        emp_rows : [(emp_obj, values_list, kinds_list)]
-          values_list[0] = 員工標籤, [1] = 時數, [2+] = 班別代號
-          kinds_list[j]  = 第 j 個日期的 pb29004 (int|None)
-        """
-        self._cv.delete("all")
-        self._rows  = emp_rows
-        self._dates = dates
-        total_w = self.EMP_W + self.HOURS_W + self.COL_W * len(dates)
-
-        for i, (emp, vals, kinds) in enumerate(emp_rows):
-            y0 = i * self.ROW_H
-            y1 = y0 + self.ROW_H
-            bg = self.BG[i % 2]
-
-            # 員工欄（靠左文字）
-            x = 0
-            self._cv.create_rectangle(x, y0, x + self.EMP_W, y1,
-                                      fill=bg, outline=self.GRID_C)
-            self._cv.create_text(x + 8, (y0 + y1) // 2, text=vals[0],
-                                 font=self.FONT, fill=self.INK,
-                                 anchor="w", width=self.EMP_W - 12)
-            x += self.EMP_W
-
-            # 時數欄（置中）
-            self._cv.create_rectangle(x, y0, x + self.HOURS_W, y1,
-                                      fill=bg, outline=self.GRID_C)
-            self._cv.create_text(x + self.HOURS_W // 2, (y0 + y1) // 2,
-                                 text=vals[1], font=self.FONT, fill=self.INK,
-                                 anchor="center")
-            x += self.HOURS_W
-
-            # 日期欄
-            for j in range(len(dates)):
-                code = vals[2 + j] if 2 + j < len(vals) else ""
-                kind = kinds[j] if j < len(kinds) else None
-                fg   = self.REST_FG if self._is_rest_cell(kind, code) else self.INK
-                self._cv.create_rectangle(x, y0, x + self.COL_W, y1,
-                                          fill=bg, outline=self.GRID_C)
-                if code:
-                    self._cv.create_text(x + self.COL_W // 2, (y0 + y1) // 2,
-                                         text=code, font=self.FONT, fill=fg,
-                                         anchor="center", width=self.COL_W - 4)
-                x += self.COL_W
-
-        total_h = len(emp_rows) * self.ROW_H
-        self._cv.configure(scrollregion=(0, 0, total_w, total_h))
-
-    @staticmethod
-    def _is_rest_cell(kind, code: str) -> bool:
-        """kind=3 → 排休紅字；kind=None 時以 991* 代碼判斷。"""
-        if kind == 3:
-            return True
-        if kind is None and code and code.startswith("991"):
-            return True
-        return False
-
-    def _handle_double(self, event) -> None:
-        if not self._on_double or not self._rows:
-            return
-        cx = self._cv.canvasx(event.x)
-        cy = self._cv.canvasy(event.y)
-        if cx < self.EMP_W + self.HOURS_W:
-            return   # 點到員工欄或時數欄
-        col_idx = int((cx - self.EMP_W - self.HOURS_W) // self.COL_W)
-        row_idx = int(cy // self.ROW_H)
-        if row_idx < 0 or row_idx >= len(self._rows):
-            return
-        if col_idx < 0 or col_idx >= len(self._dates):
-            return
-        self._on_double(self._rows[row_idx][0], col_idx)
-
-
-class _PunchTable(tk.Frame):
-    """Canvas-based table 支援單格著色。"""
-
-    COLS = [
-        ("員工代號",  90), ("員工姓名",  90), ("出勤日期", 110),
-        ("排班代號",  70), ("表定上班",  80), ("表定下班",  80),
-        ("實際上班",  80), ("實際下班",  80), ("備注",     140),
-    ]
-    ROW_H  = 27
-    HDR_H  = 32
-    FONT   = ("TkDefaultFont", 12)
-    BFONT  = ("TkDefaultFont", 12, "bold")
-    HDR_BG = "#EEF2FB"
-    BG     = ("#FFFFFF", "#F8F9FD")
-    GRID   = "#E8EBF4"
-
-    def __init__(self, parent, **kw):
-        super().__init__(parent, **kw)
-        self._data: list[tuple] = []
-        self._cv = tk.Canvas(self, bg="#FFFFFF", highlightthickness=0)
-        # 設定捲動單位=列高,讓滾輪/觸控板一格捲一列(預設 0 會導致幾乎不動)
-        self._cv.configure(yscrollincrement=self.ROW_H)
-        vsb = ttk.Scrollbar(self, orient="vertical",   command=self._cv.yview)
-        hsb = ttk.Scrollbar(self, orient="horizontal", command=self._cv.xview)
-        self._cv.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self._cv.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-        self.rowconfigure(0, weight=1)
-        self.columnconfigure(0, weight=1)
-        _bind_mousewheel(self._cv)
-        self._tw = sum(w for _, w in self.COLS)
-        self._draw_header()
-
-    def _draw_header(self):
-        x = 0
-        for name, w in self.COLS:
-            self._cv.create_rectangle(x, 0, x+w, self.HDR_H,
-                                      fill=self.HDR_BG, outline=self.GRID)
-            self._cv.create_text(x + w//2, self.HDR_H//2,
-                                 text=name, font=self.BFONT, fill="#2D3048",
-                                 anchor="center")
-            x += w
-
-    def populate(self, rows: list[tuple]) -> None:
-        """rows: list of (values_tuple, fgs_tuple) — fgs 為各格顏色，空字串=黑。"""
-        self._cv.delete("row")
-        self._data = list(rows)
-        y = self.HDR_H
-        for i, (vals, fgs) in enumerate(rows):
-            bg = self.BG[i % 2]
-            x = 0
-            for j, (val, (_, w)) in enumerate(zip(vals, self.COLS)):
-                fg = fgs[j] if j < len(fgs) and fgs[j] else "#000000"
-                self._cv.create_rectangle(x, y, x+w, y+self.ROW_H,
-                                          fill=bg, outline=self.GRID, tags="row")
-                self._cv.create_text(x+6, y+self.ROW_H//2,
-                                     text="" if val is None else str(val),
-                                     font=self.FONT, fill=fg,
-                                     anchor="w", width=w-10, tags="row")
-                x += w
-            y += self.ROW_H
-        self._cv.configure(scrollregion=(0, 0, self._tw, y))
-
-    def all_values(self) -> list[tuple]:
-        return [v for v, _ in self._data]
-
-
-class _SuggestionTable(tk.Frame):
-    """High-density suggestion list with row selection and quick apply."""
-
-    COLS = [
-        ("status", "狀態", 58, "center"),
-        ("type", "類型", 70, "center"),
-        ("date", "日期", 92, "center"),
-        ("emp", "員工", 120, "w"),
-        ("current", "原班別", 72, "center"),
-        ("scheduled", "表定", 92, "center"),
-        ("actual", "實際", 92, "center"),
-        ("delta", "差異", 92, "center"),
-        ("best", "最佳建議", 130, "w"),
-        ("hours", "工時", 52, "center"),
-        ("action", "套用", 74, "center"),
-    ]
-
-    def __init__(self, parent, on_select=None, on_apply=None, **kw):
-        super().__init__(parent, **kw)
-        self._rows: dict[str, dict] = {}
-        self._on_select = on_select
-        self._on_apply = on_apply
-        cols = [c[0] for c in self.COLS]
-        self.tv = ttk.Treeview(
-            self, style="App.Treeview", columns=cols, show="headings",
-            selectmode="browse", height=18
-        )
-        for key, label, width, anchor in self.COLS:
-            self.tv.heading(key, text=label)
-            self.tv.column(key, width=width, anchor=anchor, stretch=False)
-        ysb = ttk.Scrollbar(self, orient="vertical", command=self.tv.yview)
-        xsb = ttk.Scrollbar(self, orient="horizontal", command=self.tv.xview)
-        self.tv.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
-        self.tv.grid(row=0, column=0, sticky="nsew")
-        ysb.grid(row=0, column=1, sticky="ns")
-        xsb.grid(row=1, column=0, sticky="ew")
-        self.rowconfigure(0, weight=1)
-        self.columnconfigure(0, weight=1)
-        _bind_mousewheel(self.tv)
-        self.tv.tag_configure("applied", foreground=_C["green"])
-        self.tv.tag_configure("failed", foreground=_C["red"])
-        self.tv.tag_configure("empty", foreground=_C["muted"])
-        self.tv.bind("<<TreeviewSelect>>", self._handle_select)
-        self.tv.bind("<ButtonRelease-1>", self._handle_click)
-
-    def populate(self, rows: list[dict]) -> None:
-        self._rows = {r["id"]: r for r in rows}
-        self.tv.delete(*self.tv.get_children())
-        for row in rows:
-            tags = []
-            if row.get("status") == "已套用":
-                tags.append("applied")
-            elif row.get("status") == "失敗":
-                tags.append("failed")
-            elif not row.get("best_candidate"):
-                tags.append("empty")
-            self.tv.insert("", "end", iid=row["id"], values=self._values(row),
-                           tags=tuple(tags))
-
-    def select(self, row_id: str | None) -> None:
-        if row_id and row_id in self._rows:
-            self.tv.selection_set(row_id)
-            self.tv.focus(row_id)
-            self.tv.see(row_id)
-            if self._on_select:
-                self._on_select(self._rows[row_id])
-
-    def first_id(self) -> str | None:
-        children = self.tv.get_children()
-        return children[0] if children else None
-
-    def _values(self, row: dict) -> tuple:
-        best = row.get("best_candidate")
-        best_txt = "無合適建議"
-        hours = ""
-        action = ""
-        if best:
-            code, si, so, _d_in, _d_out, h = best
-            name = row.get("shift_names", {}).get(code, "")
-            best_txt = f"{code} {name or f'{si}-{so}'}".strip()
-            hours = f"{h:g}h"
-            action = "" if row.get("status") in ("已套用", "套用中") else "套用最佳"
-        return (
-            row.get("status", "待處理"),
-            row.get("type", ""),
-            row.get("date", ""),
-            f"{row.get('emp_id', '')} {row.get('name', '')}".strip(),
-            row.get("current_shift", ""),
-            row.get("scheduled", ""),
-            row.get("actual", ""),
-            row.get("delta", ""),
-            best_txt,
-            hours,
-            action,
-        )
-
-    def _handle_select(self, _event=None) -> None:
-        sel = self.tv.selection()
-        if sel and self._on_select:
-            self._on_select(self._rows.get(sel[0]))
-
-    def _handle_click(self, event) -> None:
-        iid = self.tv.identify_row(event.y)
-        col = self.tv.identify_column(event.x)
-        if not iid or col != f"#{len(self.COLS)}":
-            return
-        row = self._rows.get(iid)
-        if (row and row.get("best_candidate")
-                and row.get("status") not in ("已套用", "套用中")):
-            if self._on_apply:
-                self._on_apply(iid)
 
 
 class EhrsApp(ctk.CTk):
@@ -844,6 +102,8 @@ class EhrsApp(ctk.CTk):
         self._build_ui()
         if auto_login:
             self.after(250, self._do_login)
+        # 背景檢查 GitHub Releases 是否有新版（找到會自動下載並重啟）
+        self.after(800, self._check_update)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -1499,11 +759,12 @@ class EhrsApp(ctk.CTk):
 
     # ---------------------------------------------------------------- login
     def _save_and_login(self) -> None:
-        self.cfg = {
+        # 用 update 保留 config.json 既有的其他設定鍵（如 base_dept_exclude）
+        self.cfg.update({
             "account": self.s_acc.get().strip(),
             "password": self.s_pwd.get(),
             "base_url": self.s_base.get().strip() or DEFAULT_BASE_URL,
-        }
+        })
         save_config(self.cfg)
         self._do_login()
 
@@ -1844,6 +1105,32 @@ class EhrsApp(ctk.CTk):
                        corner_radius=9, font=("", 13, "bold"),
                        command=save).pack(side="left")
 
+    def _apply_local_shift_change(
+        self, emp_id: str, date_str: str, code: str | None, kind: int | None = None
+    ) -> None:
+        """單格寫入成功後就地更新記憶體班表並重繪，免去整頁重抓多月資料。
+        code=None 代表刪班。pk 留 None 無妨：下次寫入前 set_shift 都會
+        重新向伺服器抓當月 calendar 取得最新 pk。
+        記憶體中找不到該員工時退回完整重載。"""
+        emp = next((e for e in self.schedule if e.emp_id == emp_id), None)
+        if emp is None:
+            self._load_schedule()
+            return
+        if code is None:
+            emp.shifts = [s for s in emp.shifts if s.date != date_str]
+        else:
+            name = self.shift_codes.get(code, ("", 3))[0]
+            s = emp.shift_on(date_str)
+            if s is None:
+                emp.shifts.append(Shift(date=date_str, code=code, name=name,
+                                        kind=kind, pk=None))
+            else:
+                s.code = code
+                s.name = name
+                if kind is not None:
+                    s.kind = kind
+        self._refresh_schedule_view()
+
     def _apply_set(self, emp, date_str: str, code: str, kind: int = 1) -> None:
         year, month, _ = (int(x) for x in date_str.split("-"))
         self._set_status("寫入中…")
@@ -1856,7 +1143,7 @@ class EhrsApp(ctk.CTk):
 
         def done(res):
             self._set_status(f"已寫入 {emp.emp_id} {date_str} → {code}")
-            self._load_schedule()
+            self._apply_local_shift_change(emp.emp_id, date_str, code, kind)
 
         self._run_async(work, done)
 
@@ -1873,7 +1160,7 @@ class EhrsApp(ctk.CTk):
 
         def done(res):
             self._set_status(f"已刪除 {emp.emp_id} {date_str}")
-            self._load_schedule()
+            self._apply_local_shift_change(emp.emp_id, date_str, None)
 
         self._run_async(work, done)
 
@@ -2000,9 +1287,7 @@ class EhrsApp(ctk.CTk):
                 ci = _punch_mins(clock_in)
                 co = _punch_mins(clock_out)
                 if co < ci: co += 1440
-                h = (co - ci) / 60
-                if h > 9:   h -= 1
-                elif h > 4: h -= 0.5
+                h = _deduct_break((co - ci) / 60)
                 s['total_h'] += max(0, h)
             # 加班時數直接讀 meta(由 _overtime_hours 單一來源算出),不再從備注字串反解
             s['ot_h'] += meta.get("overtime_hours", 0.0)
@@ -2501,91 +1786,18 @@ class EhrsApp(ctk.CTk):
 
         self._run_async(work, done)
 
-    def _pick_employees(
-        self,
-        emps: dict[str, str],
-        preselect: set[str] | None = None,
-        *,
-        title: str = "選擇員工",
-        hint: str = "勾選要處理的員工",
-        ok_text: str = "確定",
-    ) -> set[str] | None:
-        """通用員工挑選對話框（主畫面篩選與匯入共用）。
-        preselect=None 代表預設全選；否則只勾選集合內的員工。
-        回傳勾選的 emp_id 集合，使用者關閉視窗回傳 None。"""
-        top = ctk.CTkToplevel(self)
-        top.title(title)
-        top.geometry("300x520")
-        top.configure(fg_color=_C["app_bg"])
-        top.resizable(False, True)
-        top.transient(self)
-        top.after(60, top.grab_set)
-
-        result: dict = {"value": None}
-
-        ctk.CTkLabel(top, text=hint,
-                      text_color=_C["muted"], font=("", 12)).pack(
-            padx=12, pady=(12, 4))
-
-        search_var = ctk.StringVar()
-        ctk.CTkEntry(top, placeholder_text="搜尋員工…",
-                      textvariable=search_var,
-                      border_color=_C["line"], fg_color=_C["white"],
-                      text_color=_C["ink"]).pack(fill="x", padx=12, pady=(0, 4))
-
-        scroll = ctk.CTkScrollableFrame(top, fg_color=_C["white"],
-                                          corner_radius=8, border_width=1,
-                                          border_color=_C["line"])
-        _bind_scrollable_frame_mousewheel(scroll)
-        scroll.pack(fill="both", expand=True, padx=12, pady=(4, 0))
-
-        chk_vars: dict[str, tk.BooleanVar] = {}
-        chk_widgets: dict[str, ctk.CTkCheckBox] = {}
-        for eid in sorted(emps):
-            checked = True if preselect is None else (eid in preselect)
-            var = tk.BooleanVar(value=checked)
-            label = f"{eid}  {emps[eid]}".rstrip()
-            chk = ctk.CTkCheckBox(scroll, text=label,
-                                   variable=var, text_color=_C["ink"])
-            chk.pack(anchor="w", padx=4, pady=3)
-            chk_vars[eid] = var
-            chk_widgets[eid] = chk
-
-        def _filter(*_):
-            q = search_var.get().lower()
-            for eid, w in chk_widgets.items():
-                if not q or q in eid.lower() or q in emps[eid].lower():
-                    w.pack(anchor="w", padx=4, pady=2)
-                else:
-                    w.pack_forget()
-        search_var.trace_add("write", _filter)
-
-        btn_bar = ctk.CTkFrame(top, fg_color="transparent")
-        btn_bar.pack(fill="x", padx=12, pady=(6, 0))
-        ctk.CTkButton(btn_bar, text="全選", width=80,
-                       fg_color=_C["tab_bg"], text_color=_C["ink"],
-                       hover_color=_C["line"], corner_radius=8,
-                       command=lambda: [v.set(True) for v in chk_vars.values()]
-                       ).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(btn_bar, text="清除", width=80,
-                       fg_color=_C["tab_bg"], text_color=_C["ink"],
-                       hover_color=_C["line"], corner_radius=8,
-                       command=lambda: [v.set(False) for v in chk_vars.values()]
-                       ).pack(side="left")
-
-        def apply():
-            result["value"] = {eid for eid, v in chk_vars.items() if v.get()}
-            top.destroy()
-
-        ctk.CTkButton(top, text=ok_text,
-                       fg_color=_C["accent"], hover_color=_C["acc_h"],
-                       corner_radius=9, font=("", 13, "bold"),
-                       command=apply).pack(fill="x", padx=12, pady=10)
-
-        top.wait_window()
-        return result["value"]
-
     # ── 排班頁部門 / 員工篩選 ───────────────────────────────────────────────
+    def _base_dept_exclude_keywords(self) -> tuple[str, ...]:
+        """推斷「主部門」時要排除的部門名稱關鍵字。
+
+        限制：這是針對門市環境的啟發式——沒有部門資料的員工會被歸入
+        第一個非排除部門。換到部門結構不同的單位時，可在
+        ~/.ehrs_tool/config.json 加 "base_dept_exclude": ["關鍵字", ...] 覆蓋。"""
+        cfg_val = self.cfg.get("base_dept_exclude")
+        if isinstance(cfg_val, list) and cfg_val:
+            return tuple(str(k) for k in cfg_val)
+        return ("維修中心", "(前)")
+
     def _fetch_emp_dept_map(self, start: dt.date, end: dt.date) -> dict[str, str]:
         rows = None
         # B1:若剛在打卡分頁查過同一區間,直接重用那批資料(含部門欄位),免重抓。
@@ -2599,13 +1811,15 @@ class EhrsApp(ctk.CTk):
                 return {}
         dept_map: dict[str, str] = {}
         base_dept = ""
+        exclude = self._base_dept_exclude_keywords()
         for row in rows:
             eid = _first_field(row, _EMP_ID_KEYS)
             dept = self._row_dept(row)
             if eid and dept:
                 dept_map[eid] = dept
                 name = self._dept_name_key(dept)
-                if not base_dept and name and "維修中心" not in name and "(前)" not in name:
+                if (not base_dept and name
+                        and not any(k in name for k in exclude)):
                     base_dept = dept
         if base_dept and (end - start).days == 27 and start.weekday() == 0:
             for eid in self._fetch_period_emp_ids(start, end):
@@ -2656,9 +1870,6 @@ class EhrsApp(ctk.CTk):
         if self._selected_emps and emp_id not in self._selected_emps:
             return False
         return True
-
-    def _update_sched_filter_btns(self) -> None:
-        self._update_filter_buttons()
 
     def _refresh_schedule_view(self) -> None:
         if not self.schedule:
@@ -2985,12 +2196,6 @@ class EhrsApp(ctk.CTk):
         self.punch_tbl.populate(filtered)
         self.after(50, self._compute_suggestions)
 
-    def _update_dept_btn(self) -> None:
-        self._update_filter_buttons()
-
-    def _update_emp_btn(self) -> None:
-        self._update_filter_buttons()
-
     def _open_dept_picker(self) -> None:
         # 從 _emp_dept 收集所有不重複部門
         depts = sorted(
@@ -2999,53 +2204,16 @@ class EhrsApp(ctk.CTk):
         if not depts:
             messagebox.showinfo("提示", "請先查詢打卡資料。")
             return
-
-        top = ctk.CTkToplevel(self)
-        top.title("選擇部門")
-        top.geometry("260x400")
-        top.configure(fg_color=_C["app_bg"])
-        top.resizable(False, True)
-        top.transient(self)
-        top.after(60, top.grab_set)
-
-        scroll = ctk.CTkScrollableFrame(top, fg_color=_C["white"],
-                                          corner_radius=8,
-                                          border_width=1, border_color=_C["line"])
-        _bind_scrollable_frame_mousewheel(scroll)
-        scroll.pack(fill="both", expand=True, padx=12, pady=(12, 0))
-
-        chk_vars: dict[str, tk.BooleanVar] = {}
-        for dept in depts:
-            init = self._dept_passes_filter(dept)
-            var = tk.BooleanVar(value=init)
-            ctk.CTkCheckBox(scroll, text=dept, variable=var,
-                             text_color=_C["ink"]).pack(anchor="w", padx=4, pady=3)
-            chk_vars[dept] = var
-
-        btn_bar = ctk.CTkFrame(top, fg_color="transparent")
-        btn_bar.pack(fill="x", padx=12, pady=(6, 0))
-        ctk.CTkButton(btn_bar, text="全選", width=80,
-                       fg_color=_C["tab_bg"], text_color=_C["ink"],
-                       hover_color=_C["line"], corner_radius=8,
-                       command=lambda: [v.set(True) for v in chk_vars.values()]
-                       ).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(btn_bar, text="清除", width=80,
-                       fg_color=_C["tab_bg"], text_color=_C["ink"],
-                       hover_color=_C["line"], corner_radius=8,
-                       command=lambda: [v.set(False) for v in chk_vars.values()]
-                       ).pack(side="left")
-
-        def apply():
-            selected = {d for d, v in chk_vars.items() if v.get()}
-            self._set_global_filter(
-                depts=set() if len(selected) == len(depts) else selected
-            )
-            top.destroy()
-
-        ctk.CTkButton(top, text="確定",
-                       fg_color=_C["accent"], hover_color=_C["acc_h"],
-                       corner_radius=9, font=("", 13, "bold"),
-                       command=apply).pack(fill="x", padx=12, pady=10)
+        selected = (
+            {d for d in depts if self._dept_passes_filter(d)}
+            if self._selected_depts else set()
+        )
+        self._generic_picker(
+            title="選擇部門",
+            items=depts,
+            selected=selected,
+            on_confirm=lambda s: self._set_global_filter(depts=s),
+        )
 
     def _open_emp_picker(self) -> None:
         # 從打卡快取收集所有員工
@@ -3055,80 +2223,24 @@ class EhrsApp(ctk.CTk):
             if not self._dept_passes_filter(dept):
                 continue
             emps[vals[0]] = vals[1]
-
         if not emps:
             messagebox.showinfo("提示", "請先查詢打卡資料。")
             return
-
-        top = ctk.CTkToplevel(self)
-        top.title("選擇員工")
-        top.geometry("280x490")
-        top.configure(fg_color=_C["app_bg"])
-        top.resizable(False, True)
-        top.transient(self)
-        top.after(60, top.grab_set)
-
-        # 搜尋框
-        search_var = ctk.StringVar()
-        ctk.CTkEntry(top, placeholder_text="搜尋員工…",
-                      textvariable=search_var,
-                      border_color=_C["line"], fg_color=_C["white"],
-                      text_color=_C["ink"]).pack(fill="x", padx=12, pady=(12, 4))
-
-        # 捲動式 checkbox 清單
-        scroll = ctk.CTkScrollableFrame(top, fg_color=_C["white"],
-                                          corner_radius=8,
-                                          border_width=1, border_color=_C["line"])
-        _bind_scrollable_frame_mousewheel(scroll)
-        scroll.pack(fill="both", expand=True, padx=12, pady=(4, 0))
-
-        chk_vars: dict[str, tk.BooleanVar] = {}
-        chk_widgets: dict[str, ctk.CTkCheckBox] = {}
-        for eid in sorted(emps):
-            init = (not self._selected_emps) or (eid in self._selected_emps)
-            var = tk.BooleanVar(value=init)
-            chk = ctk.CTkCheckBox(scroll, text=f"{eid}  {emps[eid]}",
-                                   variable=var, text_color=_C["ink"])
-            chk.pack(anchor="w", padx=4, pady=3)
-            chk_vars[eid] = var
-            chk_widgets[eid] = chk
-
-        def _filter(*_):
-            q = search_var.get().lower()
-            for eid, w in chk_widgets.items():
-                show = not q or q in eid.lower() or q in emps[eid].lower()
-                if show:
-                    w.pack(anchor="w", padx=4, pady=2)
-                else:
-                    w.pack_forget()
-
-        search_var.trace_add("write", _filter)
-
-        # 全選 / 清除
-        btn_bar = ctk.CTkFrame(top, fg_color="transparent")
-        btn_bar.pack(fill="x", padx=12, pady=(6, 0))
-        ctk.CTkButton(btn_bar, text="全選", width=80,
-                       fg_color=_C["tab_bg"], text_color=_C["ink"],
-                       hover_color=_C["line"], corner_radius=8,
-                       command=lambda: [v.set(True) for v in chk_vars.values()]
-                       ).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(btn_bar, text="清除", width=80,
-                       fg_color=_C["tab_bg"], text_color=_C["ink"],
-                       hover_color=_C["line"], corner_radius=8,
-                       command=lambda: [v.set(False) for v in chk_vars.values()]
-                       ).pack(side="left")
-
-        def apply():
-            selected = {eid for eid, v in chk_vars.items() if v.get()}
-            self._set_global_filter(
-                emps=set() if len(selected) == len(emps) else selected
-            )
-            top.destroy()
-
-        ctk.CTkButton(top, text="確定",
-                       fg_color=_C["accent"], hover_color=_C["acc_h"],
-                       corner_radius=9, font=("", 13, "bold"),
-                       command=apply).pack(fill="x", padx=12, pady=10)
+        items = [f"{eid}  {name}".rstrip() for eid, name in sorted(emps.items())]
+        selected = {
+            f"{eid}  {emps[eid]}".rstrip()
+            for eid in self._selected_emps
+            if eid in emps
+        }
+        self._generic_picker(
+            title="選擇員工",
+            items=items,
+            selected=selected,
+            on_confirm=lambda s: self._set_global_filter(
+                emps={item.split()[0] for item in s}
+            ),
+            searchable=True,
+        )
 
     # --------------------------------------------------------- suggest tab
     def _build_suggest_tab(self, tab) -> None:
@@ -3198,9 +2310,6 @@ class EhrsApp(ctk.CTk):
         self._suggestion_by_id: dict[str, dict] = {}
         self._current_suggestion_id: str | None = None
         self._clear_suggestion_detail("請先到打卡分頁查詢，或從左側列表選擇一筆建議。")
-
-    def _update_suggest_filter_btns(self) -> None:
-        self._update_filter_buttons()
 
     def _suggest_row_passes_filter(self, vals: tuple) -> bool:
         emp_id = vals[0]
@@ -3313,7 +2422,7 @@ class EhrsApp(ctk.CTk):
                 if co_m < si_m - 120:
                     co_m += 1440
                 raw_h = (co_m - ci_m) / 60.0
-                actual_h = raw_h - (1.0 if raw_h >= 9.0 else 0.5)
+                actual_h = _deduct_break(raw_h)
             else:
                 actual_h = cur_h + 1.0
             pref_h = round(actual_h * 2) / 2   # 四捨五入到 0.5
@@ -3544,7 +2653,7 @@ class EhrsApp(ctk.CTk):
             row["error"] = ""
             self._set_status(f"已套用：{row['emp_id']} {row['date']} → {code}")
             self._render_suggestions(select_id=row_id)
-            self._load_schedule()
+            self._apply_local_shift_change(row["emp_id"], row["date"], code, kind)
 
         def failed(exc: Exception):
             row["status"] = "失敗"
@@ -3554,25 +2663,6 @@ class EhrsApp(ctk.CTk):
             messagebox.showerror("套用失敗", str(exc))
 
         self._run_async(work, done, on_error=failed)
-
-    def _apply_suggestion(self, emp_id: str, date_str: str, code: str, kind: int = 1) -> None:
-        if not self._need_client():
-            return
-        year, month, _ = (int(x) for x in date_str.split("-"))
-        self._set_status(f"套用中：{emp_id} {date_str} → {code}（日種類={kind}）…")
-
-        def work():
-            return self.client.set_shift(
-                year, month, emp_id, date_str, code,
-                kind=kind,
-                dry_run=False,
-            )
-
-        def done(_):
-            self._set_status(f"已套用：{emp_id} {date_str} → {code}")
-            self._load_schedule()
-
-        self._run_async(work, done)
 
 
 def main() -> None:

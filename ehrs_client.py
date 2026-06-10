@@ -636,6 +636,35 @@ class EhrsClient:
             f"確認回合超過上限 {max_rounds},疑似異常循環(已確認:{confirmations})"
         )
 
+    def _calendar_for_write(
+        self, year: int, month: int, emp_id: str, date: DateLike
+    ) -> tuple[dict, dict]:
+        """取得適合寫入「該員工該日」的 (filter, calendar)。
+
+        先用月曆檢視(維持既有行為);若該月查不到該員工——典型情況是
+        跨月期間的溢出日期(如第7期 6/8～7/5 的 7/1～7/5,七月月曆尚未
+        開啟會回 0 人)——改用彈性週期檢視(shiftType=1,起迄為該日所屬
+        四週期間),逐 flexType 找到該員工為止(與 set_shifts_bulk 同邏輯)。
+        都找不到時回傳原月曆,讓後續流程丟出「找不到員工」。"""
+        filt = self._schedule_filter(year, month)
+        calendar = self.get_schedule_raw(year, month)
+        if any(e.get("pa51002") == emp_id
+               for e in calendar.get("shiftEmployees", [])):
+            return filt, calendar
+        ps = _period_start_of(date)
+        pe = ps + _dt.timedelta(days=_PERIOD_DAYS - 1)
+        for ft in (2, 1, 0):   # 4週=2、雙週=1、單週=0
+            ov = dict(shiftType=1, flexType=ft,
+                      start=_iso_ms(ps), end=_iso_ms(pe, end_of_day=True))
+            try:
+                cal = self.get_schedule_raw(ps.year, ps.month, **ov)
+            except EhrsError:
+                continue
+            if any(e.get("pa51002") == emp_id
+                   for e in cal.get("shiftEmployees", [])):
+                return dict(self._schedule_filter(ps.year, ps.month), **ov), cal
+        return filt, calendar
+
     def set_shift(
         self,
         year: int,
@@ -650,13 +679,13 @@ class EhrsClient:
         """建立或修改某員工某天的班別。
 
         會先抓當月班表,若該日已有班(有 pb29995)走 Update,否則走 Create。
+        當月查不到該員工時(跨月期間溢出日期)自動改用彈性週期檢視。
         kind=None(預設)時自動從班表偵測該班別代號使用的種類,找不到預設 3。
         dry_run=True(預設)只回傳 payload 不送出。
         confirm=True 時自動通過伺服器的規則提醒(例:例假數),等同 UI 點確認;
         想看到提醒就停下時設 confirm=False。
         """
-        filt = self._schedule_filter(year, month)
-        calendar = self.get_schedule_raw(year, month)
+        filt, calendar = self._calendar_for_write(year, month, emp_id, date)
         if kind is None:
             kind = self._kind_from_calendar(calendar, shift_code, default=3)
         payload = self._build_shift_payload(
@@ -867,9 +896,9 @@ class EhrsClient:
         date: DateLike,
         dry_run: bool = True,
     ) -> dict:
-        """刪除某員工某天的班。dry_run=True(預設)只回傳 payload 不送出。"""
-        filt = self._schedule_filter(year, month)
-        calendar = self.get_schedule_raw(year, month)
+        """刪除某員工某天的班。dry_run=True(預設)只回傳 payload 不送出。
+        當月查不到該員工時(跨月期間溢出日期)自動改用彈性週期檢視。"""
+        filt, calendar = self._calendar_for_write(year, month, emp_id, date)
         emp = next(
             (e for e in calendar.get("shiftEmployees", [])
              if e.get("pa51002") == emp_id),
